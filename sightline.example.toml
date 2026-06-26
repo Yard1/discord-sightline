@@ -1,0 +1,244 @@
+[bot]
+# Optional. Set this to the bot application's user ID to make permission
+# diagnostics independent of the token's /users/@me identity lookup.
+user_id = "1519891793934815415"
+
+[queue]
+# Runtime limits live here. Guild-specific config is stored in each guild's
+# private #sightline-db channel and edited with /config.
+max_size = 500
+enqueue_timeout_ms = 50
+# Shared CPU-bound budget for decode/hash and matcher work.
+cpu_concurrency = 4
+# Download IO budget. Image worker slots are derived from this so downloads can
+# overlap while CPU-bound work remains capped by cpu_concurrency.
+download_concurrency = 64
+# OCR HTTP budget. OCR follow-ups are off the image worker hot path.
+ocr_concurrency = 4
+max_images_per_message = 10
+hash_outcome_cache_size = 100000
+# Process-wide cap for original image bytes retained by OCR/specimen follow-ups.
+byte_store_max_bytes = 67108864
+
+[scan]
+# Default for newly configured guilds and empty Advanced modal resets.
+# Guild admins can edit scan_policy.exempt_administrators from /config -> Advanced.
+exempt_administrators = true
+# Default automated message scan image types for newly configured guilds.
+# Guild admins can edit scan_policy.allowed_extensions from /config -> Advanced.
+# Values are extension names without dots; jpeg is normalized to jpg.
+allowed_extensions = ["jpg"]
+
+[download]
+# VM hard ceiling. Guild admins can set an equal-or-lower scan_policy.max_file_bytes
+# value from /config.
+max_bytes = 10485760
+max_decoded_pixels = 12000000
+timeout_seconds = 2
+max_retries = 3
+retry_base_delay_ms = 150
+# Keep one Discord CDN HTTP/2 connection warm with a cheap HEAD request when
+# real image traffic has not touched the host recently. The warm request uses
+# the same reqwest client as image downloads and does not consume download
+# concurrency permits.
+warmer_enabled = true
+warmer_period_seconds = 270
+
+[download.preview]
+# Prefer Discord-resized proxy previews for visual matching when metadata says
+# the original is larger than the active normalized matching size. Exact-byte
+# matching and OCR evidence stay original-image based. Image-backed specimen DB
+# messages attach both the original and generated Discord preview variant.
+enabled = true
+mode = "match_normalized"
+skip_animated = true
+# Only request Discord proxy previews when the original is large enough that
+# racing a resized proxy can plausibly beat the original download/decode path.
+min_original_bytes = 262144
+
+[match]
+# Local defaults used by CLI comparison and by specimen creation. Production
+# Confirmed and suspicious thresholds are stored in Discord guild config.
+score_threshold = 63.0
+suspicious_score_threshold = 20.0
+perceptual_score_weight = 1.8
+local_anchor_score_weight = 2.2
+dense_local_anchor_score_weight = 1.4
+visual_signature_score_weight = 0.0
+visual_shape_score_weight = 1.0
+visual_shape_score_cap = 10.0
+perceptual_score_floor = 35.0
+local_score_full_hits = 500
+local_score_full_regions = 14
+local_score_full_spread = 700.0
+visual_shape_score_full = 300.0
+cluster_coherence_enabled = true
+cluster_hard_score = 63
+cluster_chrome_ceiling_score = 19
+cluster_member_score = 25
+cluster_coherence_score = 63
+cluster_min_size = 2
+cluster_coverage_floor_permille = 0
+phash64_max_distance = 16
+dhash64_max_distance = 12
+perceptual_hash_max_total_distance = 26
+suspicious_phash64_max_distance = 16
+suspicious_dhash64_max_distance = 15
+suspicious_perceptual_hash_max_total_distance = 30
+suspicious_perceptual_visual_support_distance_slack = 6
+perceptual_orientation_correction = false
+perceptual_orientation_max_degrees = 10.0
+perceptual_orientation_step_degrees = 1.0
+perceptual_orientation_min_gain = 1.02
+local_anchors_enabled = true
+local_max_width = 768
+local_max_height = 2048
+local_max_area = 786432
+local_max_aspect_ratio = 8.0
+local_tile_width = 64
+local_tile_height = 32
+local_stride = 12
+local_tile_budget = 5000
+local_hash_cap = 3000
+local_anchor_count = 512
+local_anchor_max_distance = 12
+local_min_anchor_hits = 80
+local_min_distinct_regions = 10
+local_max_mean_distance = 7.0
+local_luma_candidate_max_delta = 55
+local_contrast_candidate_max_delta = 50
+local_edge_density_candidate_max_delta = 55
+local_position_candidate_max_delta = 100
+visual_luma_zero_score_delta = 70
+visual_color_zero_score_delta = 90
+visual_grid_luma_zero_score_delta = 80
+visual_text_grid_zero_score_delta = 70
+geometry_min_short_edge = 640
+geometry_min_area = 350000
+geometry_max_aspect_ratio = 1.4
+geometry_max_aspect_delta = 0.45
+geometry_max_width_delta = 0.30
+geometry_max_height_delta = 0.30
+geometry_enable_affine = true
+geometry_enable_homography = true
+geometry_model_slack = 2.0
+geometry_max_anisotropy = 1.6
+geometry_max_perspective = 2.2
+geometry_affine_min_extra_inliers = 1
+geometry_affine_min_extra_regions = 0
+geometry_affine_max_mean_residual = 22.0
+geometry_homography_min_extra_inliers = 2
+geometry_homography_min_extra_regions = 1
+geometry_homography_max_mean_residual = 18.0
+geometry_ratio_min_margin = 2
+geometry_enable_prosac_fallback = true
+geometry_prosac_max_iters = 64
+geometry_prosac_min_inliers = 8
+local_suspicious_min_anchor_hits = 20
+local_suspicious_min_distinct_regions = 10
+local_suspicious_max_mean_distance = 12.0
+local_suspicious_unverified_support_enabled = true
+local_suspicious_unverified_support_min_anchor_hits = 50
+local_suspicious_unverified_support_min_distinct_regions = 25
+local_suspicious_unverified_support_min_retention_permille = 200
+local_suspicious_unverified_support_max_mean_distance = 11.75
+local_suspicious_unverified_support_max_perceptual_total_distance = 51
+local_suspicious_unverified_support_max_aspect_delta = 0.45
+local_suspicious_unverified_support_max_dimension_delta = 0.55
+suspicious_local_luma_candidate_max_delta = 70
+suspicious_local_contrast_candidate_max_delta = 65
+suspicious_local_edge_density_candidate_max_delta = 75
+suspicious_local_position_candidate_max_delta = 120
+suspicious_visual_luma_zero_score_delta = 95
+suspicious_visual_color_zero_score_delta = 120
+suspicious_visual_grid_luma_zero_score_delta = 110
+suspicious_visual_text_grid_zero_score_delta = 100
+suspicious_geometry_min_short_edge = 640
+suspicious_geometry_min_area = 350000
+suspicious_geometry_max_aspect_ratio = 1.36
+suspicious_geometry_max_aspect_delta = 0.35
+suspicious_geometry_max_width_delta = 0.20
+suspicious_geometry_max_height_delta = 0.20
+visual_shape_min_middle_text_percent = 35
+visual_shape_min_center_text_percent = 0
+visual_shape_max_center_text_percent = 78
+visual_shape_max_edge_text_percent = 46
+visual_shape_min_signals = 4
+visual_shape_min_text_grid_mean = 24
+visual_shape_max_text_grid_mean = 170
+visual_shape_min_text_regions = 34
+visual_shape_min_luma_mean = 30
+visual_shape_max_luma_mean = 92
+visual_shape_min_luma_std = 50
+visual_shape_max_luma_std = 80
+visual_shape_min_local_hashes = 180
+visual_shape_max_rgb_spread = 34
+visual_shape_sparse_max_luma_mean = 35
+visual_shape_sparse_max_text_grid_mean = 110
+visual_shape_sparse_min_local_hashes = 80
+
+[text_gate]
+# Loaded defaults for first-time guild setup and empty Advanced modal resets.
+# Values are normalized/lowercased before use.
+enabled = true
+keyword_threshold = 3
+keyword_max_distance = 1
+keywords = [
+  "USDT",
+  "Rakeback",
+  "Promo",
+  "cryptocurrency",
+  "casino",
+  "MrBeast",
+  "reward",
+  "bonus",
+  "crypto",
+  "withdraw",
+  "registers",
+  "register",
+  "wallet",
+]
+sentences = [
+  "the money will be transferred to your",
+  "network fee 0",
+  "activate code for bonus",
+  "Enter the promo code",
+  "Activate your promo code",
+  "Enter the special promo code",
+  "cryptocurrency casino",
+  "I will also launch new rates on",
+  "bonus - play or withdraw",
+  "This post will be deleted an hour after publication so that only the fastest",
+  "I will also soon launch new rates",
+  "How to claim your reward",
+  "crypto casino",
+  "withdraw the bonus",
+  "transferred to your specified wallet",
+]
+
+[commands]
+# Registers slash commands and message right-click commands on startup.
+register_on_startup = true
+
+[telemetry.dial9]
+# Disabled in production by default. Enable during testing to write Dial9 trace
+# segments to disk for post-hoc runtime/image-processing analysis.
+enabled = false
+trace_dir = "target/dial9-traces"
+max_disk_usage_mb = 1024
+rotation_seconds = 60
+shutdown_timeout_seconds = 10
+runtime_name = "discord-sightline"
+
+[ocr_space]
+# OCR.space API settings. The API key is read from OCR_SPACE_API_KEY.
+# The real OCR API endpoint is api.ocr.space/parse/image; ocr.space/ocrapi is
+# the documentation page.
+endpoint = "https://api.ocr.space/parse/image"
+timeout_seconds = 20
+total_timeout_seconds = 30
+max_retries = 3
+retry_base_delay_ms = 750
+language = "eng"
+scale = true
+detect_orientation = true
