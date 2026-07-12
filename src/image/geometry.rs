@@ -189,11 +189,14 @@ pub enum Model {
 pub struct GeoMatch {
     pub scale: f32,
     pub angle: f32,
-    #[allow(dead_code)]
-    pub z: (f32, f32),
-    #[allow(dead_code)]
-    pub t: P,
     /// Projective model used for residuals and projection.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the recovered projective model is retained for diagnostics and geometry tests"
+        )
+    )]
     pub homography: Mat3,
     pub model: Model,
     pub inlier_count: usize,
@@ -210,17 +213,6 @@ pub struct GeometryScratch {
     translations: Vec<P>,
     preliminary: Vec<Correspondence>,
     eval: Vec<Correspondence>,
-}
-
-/// Map a specimen point through the recovered model.
-#[allow(dead_code)]
-pub fn project(match_: &GeoMatch, specimen_point: P) -> P {
-    h_apply(&match_.homography, specimen_point)
-}
-
-#[cfg(test)]
-pub fn verify_geometry(correspondences: &[Correspondence], cfg: &GeoCfg) -> Option<GeoMatch> {
-    verify_geometry_with_scratch(correspondences, cfg, &mut GeometryScratch::default())
 }
 
 pub fn verify_geometry_with_scratch(
@@ -275,16 +267,8 @@ pub fn verify_geometry_with_scratch(
         && let Some((inliers, h)) = prosac_homography(&scratch.correspondences, cfg, residual_sq)
         && inliers.len() >= cfg.min_inliers
     {
-        let (scale, angle, z, t) = readout(&h, centroid_spec(&inliers));
-        return Some(build_match(
-            inliers,
-            Model::Homography,
-            h,
-            scale,
-            angle,
-            z,
-            t,
-        ));
+        let (scale, angle, _, _) = readout(&h, centroid_spec(&inliers));
+        return Some(build_match(inliers, Model::Homography, h, scale, angle));
     }
     None
 }
@@ -400,9 +384,7 @@ fn voter_escalate(
         .mul_add(refined_z.0, refined_z.1 * refined_z.1)
         .sqrt();
     let angle = refined_z.1.atan2(refined_z.0);
-    Some(build_match(
-        inliers, model, h, scale, angle, refined_z, refined_t,
-    ))
+    Some(build_match(inliers, model, h, scale, angle))
 }
 
 // Assemble diagnostics under the final model.
@@ -412,8 +394,6 @@ fn build_match(
     h: Mat3,
     scale: f32,
     angle: f32,
-    z: (f32, f32),
-    t: P,
 ) -> GeoMatch {
     let mut residual_sum = 0.0f32;
     let mut hamming_sum = 0.0f32;
@@ -426,8 +406,6 @@ fn build_match(
     GeoMatch {
         scale,
         angle,
-        z,
-        t,
         homography: h,
         model,
         inlier_count,
@@ -1444,18 +1422,19 @@ mod tests {
                 second_hamming: u8::MAX,
             });
         }
-        let m = verify_geometry(
+        let m = verify_geometry_with_scratch(
             &cs,
             &GeoCfg {
                 inlier_residual: 6.0,
                 ..Default::default()
             },
+            &mut GeometryScratch::default(),
         )
         .expect("should verify");
         assert_eq!(m.inlier_count, 5);
         assert!((m.scale - 0.8).abs() < 0.03);
         assert!(m.region_count >= 3);
-        let proj = project(&m, pts[0]);
+        let proj = h_apply(&m.homography, pts[0]);
         assert!(proj.sub(h_apply(&h, pts[0])).len2().sqrt() < 1.0);
     }
 
@@ -1483,7 +1462,7 @@ mod tests {
             min_inliers: 5,
             ..Default::default()
         };
-        let m = verify_geometry(&cs, &cfg);
+        let m = verify_geometry_with_scratch(&cs, &cfg, &mut GeometryScratch::default());
         assert!(m.is_none() || m.unwrap().inlier_count < 5);
     }
 
@@ -1507,16 +1486,18 @@ mod tests {
             .enumerate()
             .map(|(i, &p)| corr(p, h_apply(&h, p), i as u32, (i % 4) as u16))
             .collect();
-        let off = verify_geometry(
+        let mut scratch = GeometryScratch::default();
+        let off = verify_geometry_with_scratch(
             &cs,
             &GeoCfg {
                 enable_affine: false,
                 enable_homography: false,
                 ..Default::default()
             },
+            &mut scratch,
         )
         .unwrap();
-        let on = verify_geometry(&cs, &GeoCfg::default()).unwrap();
+        let on = verify_geometry_with_scratch(&cs, &GeoCfg::default(), &mut scratch).unwrap();
         // The richer model should explain the same points with lower residual.
         assert!(on.inlier_count >= off.inlier_count);
         assert!(on.mean_residual < off.mean_residual);
@@ -1540,13 +1521,14 @@ mod tests {
             .enumerate()
             .map(|(i, &p)| corr(p, h_apply(&h, p), i as u32, i as u16))
             .collect();
-        let m = verify_geometry(
+        let m = verify_geometry_with_scratch(
             &cs,
             &GeoCfg {
                 enable_affine: false,
                 enable_homography: false,
                 ..Default::default()
             },
+            &mut GeometryScratch::default(),
         )
         .unwrap();
         assert_eq!(m.model, Model::Similarity);
@@ -1597,7 +1579,8 @@ mod tests {
             enable_prosac_fallback: true,
             ..Default::default()
         };
-        let m = verify_geometry(&cs, &cfg).expect("PROSAC should recover the homography");
+        let m = verify_geometry_with_scratch(&cs, &cfg, &mut GeometryScratch::default())
+            .expect("PROSAC should recover the homography");
         assert_eq!(m.model, Model::Homography);
         assert!(m.inlier_count >= 7);
     }
@@ -1642,12 +1625,13 @@ mod tests {
                 second_hamming: 22,
             });
         }
-        let with = verify_geometry(
+        let with = verify_geometry_with_scratch(
             &cs,
             &GeoCfg {
                 ratio_min_margin: 10,
                 ..Default::default()
             },
+            &mut GeometryScratch::default(),
         )
         .unwrap();
         // Every surviving inlier passed the distinctiveness margin.

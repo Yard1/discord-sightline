@@ -27,14 +27,13 @@ use crate::{
         types::{
             FingerprintRepresentation, GeometryModel, ImageAnchor, ImageFingerprint,
             ImageVisualSignature, LocalImageHash, MatchConfidence, MatchDiagnostics, MatchOutcome,
-            MatchStepDiagnostic,
+            MatchStepDiagnostic, Xxh128,
         },
     },
 };
-use im::HashMap as PersistentHashMap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Serialize;
-use std::sync::Arc;
+use std::{borrow::Cow, hash::Hash, sync::Arc};
 
 const DENSE_LOCAL_CANDIDATE_SCAN_CAP_PER_SCALE: usize = 512;
 const DENSE_LOCAL_MAX_BUCKET_SIZE: usize = 1024;
@@ -49,13 +48,6 @@ const CLUSTER_GRAPH_BUILD_FLOOR: u32 = 1;
 const CLUSTER_GRAPH_MAX_SPECIMENS: usize = 512;
 const CLUSTER_GRAPH_MAX_PAIR_EVALUATIONS: usize = 100_000;
 
-fn hex32_to_u128(value: &str) -> Option<u128> {
-    if value.len() != 32 {
-        return None;
-    }
-    u128::from_str_radix(value, 16).ok()
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct FingerprintComparison {
     pub exact_xxh128: bool,
@@ -68,7 +60,7 @@ pub struct FingerprintComparison {
     pub suspicious: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct LocalAnchorComparison {
     pub matched: bool,
     pub suspicious: bool,
@@ -251,25 +243,22 @@ pub fn confirmed_tier1_policy(policy: &DetectionPolicy) -> DetectionPolicy {
 
 #[derive(Debug, Clone)]
 struct IndexedSpecimen {
-    record: SpecimenRecord,
-    byte_xxh128: Option<u128>,
-    phash64: Option<u64>,
-    dhash64: Option<u64>,
-    visual: ImageVisualSignature,
+    record: Arc<SpecimenRecord>,
+    byte_xxh128: Option<Xxh128>,
+    perceptual_hash_id: PerceptualHashId,
+    visual: Arc<ImageVisualSignature>,
     geometry: FingerprintGeometry,
-    anchors: Vec<ParsedAnchor>,
-    dense_local_anchors: Vec<ParsedLocalHash>,
+    anchors: Arc<[ParsedAnchor]>,
+    dense_local_anchors: Arc<[ParsedLocalHash]>,
 }
 
 #[derive(Debug, Clone)]
 struct IndexedSpecimenParts {
-    byte_xxh128: Option<u128>,
-    phash64: Option<u64>,
-    dhash64: Option<u64>,
-    visual: ImageVisualSignature,
+    byte_xxh128: Option<Xxh128>,
+    visual: Arc<ImageVisualSignature>,
     geometry: FingerprintGeometry,
-    anchors: Vec<ParsedAnchor>,
-    dense_local_anchors: Vec<ParsedLocalHash>,
+    anchors: Arc<[ParsedAnchor]>,
+    dense_local_anchors: Arc<[ParsedLocalHash]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -277,8 +266,6 @@ struct IndexedSpecimenPartsInput<'a> {
     width: u32,
     height: u32,
     byte_xxh128: &'a str,
-    phash64: &'a str,
-    dhash64: &'a str,
     visual: &'a ImageVisualSignature,
     anchors: &'a [ImageAnchor],
     local_hashes: &'a [LocalImageHash],
@@ -299,7 +286,7 @@ impl MatchVariant {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 struct ParsedAnchor {
     hash: u64,
     hash2: u64,
@@ -316,20 +303,79 @@ struct ParsedAnchor {
     edge_density: u8,
 }
 
+type PerceptualHashId = u32;
+const INVALID_PERCEPTUAL_HASH_ID: PerceptualHashId = PerceptualHashId::MAX;
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+struct PerceptualHashes {
+    phash64: Option<u64>,
+    dhash64: Option<u64>,
+}
+
+impl PerceptualHashes {
+    fn parse(phash64: &str, dhash64: &str) -> Self {
+        Self {
+            phash64: hex16_to_u64(phash64),
+            dhash64: hex16_to_u64(dhash64),
+        }
+    }
+}
+
+fn intern_perceptual_hashes(
+    hashes: PerceptualHashes,
+    values: &mut Vec<PerceptualHashes>,
+    interner: &mut HashMap<PerceptualHashes, PerceptualHashId>,
+) -> PerceptualHashId {
+    if let Some(&id) = interner.get(&hashes) {
+        return id;
+    }
+    let id = values.len() as PerceptualHashId;
+    values.push(hashes);
+    interner.insert(hashes, id);
+    id
+}
+
+fn intern_value<T>(value: &mut Arc<T>, interner: &mut HashMap<Arc<T>, Arc<T>>)
+where
+    T: Eq + Hash,
+{
+    if let Some(existing) = interner.get(value.as_ref()) {
+        *value = Arc::clone(existing);
+    } else {
+        interner.insert(Arc::clone(value), Arc::clone(value));
+    }
+}
+
+fn intern_slice<T>(value: &mut Arc<[T]>, interner: &mut HashMap<Arc<[T]>, Arc<[T]>>)
+where
+    T: Eq + Hash,
+{
+    if let Some(existing) = interner.get(value.as_ref()) {
+        *value = Arc::clone(existing);
+    } else {
+        interner.insert(Arc::clone(value), Arc::clone(value));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Matcher {
     specimens: Vec<IndexedSpecimen>,
     preview_specimens: Vec<IndexedSpecimen>,
-    xxh128_index: HashMap<u128, usize>,
-    preview_xxh128_index: HashMap<u128, usize>,
-    phash_segment_index: matcher_opt::FlatSegmentIndex<usize>,
-    dhash_segment_index: matcher_opt::FlatSegmentIndex<usize>,
-    preview_phash_segment_index: matcher_opt::FlatSegmentIndex<usize>,
-    preview_dhash_segment_index: matcher_opt::FlatSegmentIndex<usize>,
-    anchor_segment_index: matcher_opt::FlatSegmentIndex<IndexedAnchorRef>,
-    preview_anchor_segment_index: matcher_opt::FlatSegmentIndex<IndexedAnchorRef>,
-    dense_local_segment_index: matcher_opt::FlatSegmentIndex<IndexedDenseLocalRef>,
-    preview_dense_local_segment_index: matcher_opt::FlatSegmentIndex<IndexedDenseLocalRef>,
+    perceptual_hashes: Vec<PerceptualHashes>,
+    xxh128_index: HashMap<Xxh128, usize>,
+    preview_xxh128_index: HashMap<Xxh128, usize>,
+    phash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
+    dhash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
+    preview_phash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
+    preview_dhash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
+    anchor_segment_index: matcher_opt::FlatSegmentIndex<ReferenceId>,
+    preview_anchor_segment_index: matcher_opt::FlatSegmentIndex<ReferenceId>,
+    dense_local_segment_index: matcher_opt::FlatSegmentIndex<ReferenceId>,
+    preview_dense_local_segment_index: matcher_opt::FlatSegmentIndex<ReferenceId>,
+    anchor_references: Vec<IndexedAnchorRef>,
+    preview_anchor_references: Vec<IndexedAnchorRef>,
+    dense_local_references: Vec<IndexedDenseLocalRef>,
+    preview_dense_local_references: Vec<IndexedDenseLocalRef>,
     specimen_id_index: HashMap<String, SpecimenId>,
     preview_specimen_id_index: HashMap<String, SpecimenId>,
     coherence_graph: CoherenceGraph,
@@ -339,8 +385,8 @@ pub struct Matcher {
 
 #[derive(Debug, Clone, Default)]
 pub struct ExactHashIndex {
-    by_xxh128: PersistentHashMap<u128, Arc<ExactHashSpecimen>>,
-    by_specimen_id: PersistentHashMap<String, u128>,
+    by_xxh128: HashMap<Xxh128, Vec<Arc<ExactHashSpecimen>>>,
+    by_specimen_id: HashMap<String, Xxh128>,
 }
 
 impl ExactHashIndex {
@@ -353,63 +399,60 @@ impl ExactHashIndex {
     }
 
     pub fn add_record(&mut self, record: &SpecimenRecord) {
-        let specimen = Arc::new(ExactHashSpecimen::new(record));
-        let Some(byte_xxh128) = hex32_to_u128(&record.image.byte_xxh128) else {
+        self.remove_specimen(&record.specimen_id);
+        let Some(byte_xxh128) = Xxh128::from_hex(&record.image.byte_xxh128) else {
             return;
         };
+        let specimen = Arc::new(ExactHashSpecimen::new(record));
         self.by_specimen_id
             .insert(specimen.specimen_id.clone(), byte_xxh128);
-        self.by_xxh128.insert(byte_xxh128, specimen);
+        self.by_xxh128
+            .entry(byte_xxh128)
+            .or_default()
+            .push(specimen);
     }
 
     pub fn remove_specimen(&mut self, specimen_id: &str) -> bool {
         let Some(byte_xxh128) = self.by_specimen_id.remove(specimen_id) else {
             return false;
         };
-        self.by_xxh128.remove(&byte_xxh128).is_some()
+        let Some(specimens) = self.by_xxh128.get_mut(&byte_xxh128) else {
+            return false;
+        };
+        specimens.retain(|specimen| specimen.specimen_id != specimen_id);
+        if specimens.is_empty() {
+            self.by_xxh128.remove(&byte_xxh128);
+        }
+        true
     }
 
     pub fn contains_byte_xxh128(&self, byte_xxh128: &str) -> bool {
-        hex32_to_u128(byte_xxh128).is_some_and(|key| self.by_xxh128.contains_key(&key))
+        Xxh128::from_hex(byte_xxh128).is_some_and(|key| self.by_xxh128.contains_key(&key))
     }
 
     pub fn find_for_policy(
         &self,
-        byte_xxh128: &str,
+        byte_xxh128: Xxh128,
         policy: &DetectionPolicy,
     ) -> Option<MatchOutcome> {
+        let specimen = self.by_xxh128.get(&byte_xxh128)?.first()?;
         for (threshold, suspicious, name) in [
             (&policy.confirmed.threshold, false, "confirmed"),
             (&policy.suspicious.threshold, true, "suspicious"),
         ] {
-            if threshold.exact_xxh128
-                && let Some(outcome) = self.find(byte_xxh128, suspicious, name)
-            {
-                return Some(outcome);
+            if threshold.exact_xxh128 {
+                let mut diagnostics = match_diagnostics_for_exact_hash_specimen(specimen);
+                diagnostics.steps.push(exact_xxh128_step(
+                    name,
+                    true,
+                    Some(specimen.specimen_id.clone()),
+                    Some(1),
+                    None,
+                ));
+                return Some(exact_hash_outcome(specimen, suspicious, diagnostics));
             }
         }
         None
-    }
-
-    fn find(
-        &self,
-        byte_xxh128: &str,
-        suspicious: bool,
-        threshold_name: &'static str,
-    ) -> Option<MatchOutcome> {
-        let specimen = self.by_xxh128.get(&hex32_to_u128(byte_xxh128)?)?;
-        let mut diagnostics = match_diagnostics_for_exact_hash_specimen(
-            specimen,
-            FingerprintRepresentation::Original,
-        );
-        diagnostics.steps.push(exact_xxh128_step(
-            threshold_name,
-            true,
-            Some(specimen.specimen_id.clone()),
-            Some(1),
-            None,
-        ));
-        Some(exact_hash_outcome(specimen, suspicious, diagnostics))
     }
 }
 
@@ -462,15 +505,17 @@ pub struct BucketOccupancyStats {
 
 #[derive(Debug, Clone, Copy)]
 struct IndexedAnchorRef {
-    specimen_index: usize,
-    anchor_index: usize,
+    specimen_index: SpecimenId,
+    anchor_index: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct IndexedDenseLocalRef {
-    specimen_index: usize,
-    dense_local_index: usize,
+    specimen_index: SpecimenId,
+    dense_local_index: u32,
 }
+
+type ReferenceId = u32;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CandidateIndexStats {
@@ -485,14 +530,393 @@ struct CandidateSelection {
 }
 
 #[derive(Default)]
+pub(crate) struct MatcherScratch {
+    evaluation: MatchEvaluationCache,
+}
+
+#[derive(Default)]
 struct MatchEvaluationCache {
+    perceptual_candidates: PerceptualCandidateCache,
     original_local_selection: Option<CandidateSelection>,
     preview_local_selection: Option<CandidateSelection>,
     original_anchor_hit_filter: Option<LocalFeatureFilter>,
     preview_anchor_hit_filter: Option<LocalFeatureFilter>,
     original_anchor_hits: HashMap<usize, Vec<AnchorHit>>,
     preview_anchor_hits: HashMap<usize, Vec<AnchorHit>>,
+    correspondences: Vec<Correspondence>,
     geometry_scratch: GeometryScratch,
+    local_candidates: LocalCandidateScratch,
+    compact: CompactMatchScratch,
+}
+
+impl MatchEvaluationCache {
+    fn reset(&mut self) {
+        self.perceptual_candidates.key = None;
+        self.original_local_selection = None;
+        self.preview_local_selection = None;
+        self.original_anchor_hit_filter = None;
+        self.preview_anchor_hit_filter = None;
+        self.original_anchor_hits.clear();
+        self.preview_anchor_hits.clear();
+        self.compact.evidence.clear();
+        self.compact.touched_specimens.clear();
+        self.compact.cluster_matches.clear();
+    }
+}
+
+#[derive(Default)]
+struct LocalCandidateScratch {
+    query_buckets: Vec<(usize, usize, usize)>,
+    seen_pairs: HashSet<u64>,
+    seen_votes: HashSet<u64>,
+    reference_generations: Vec<u32>,
+    reference_hits: Vec<BestReferenceHit>,
+    reference_generation: u32,
+    touched_references: Vec<ReferenceId>,
+    specimen_generations: Vec<u32>,
+    specimen_hits: Vec<usize>,
+    specimen_votes: Vec<u32>,
+    specimen_quality: Vec<u64>,
+    specimen_generation: u32,
+    touched_specimens: Vec<SpecimenId>,
+    ranked: Vec<(usize, usize, u32, u64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompactMatchStage {
+    Perceptual,
+    Anchors,
+    DenseLocalAnchors,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompactEvidence {
+    specimen_id: SpecimenId,
+    confidence: MatchConfidence,
+    stage: CompactMatchStage,
+    stage_score: f32,
+    phash64_distance: Option<u32>,
+    dhash64_distance: Option<u32>,
+    local: Option<LocalAnchorComparison>,
+    candidates_considered: usize,
+    geometry_compatible: Option<bool>,
+    visual_compatible: Option<bool>,
+    reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompactWinner {
+    evidence: CompactEvidence,
+    score: f32,
+    confidence: MatchConfidence,
+}
+
+#[derive(Default)]
+struct CompactMatchScratch {
+    evidence: Vec<CompactEvidence>,
+    specimen_generations: Vec<u32>,
+    specimen_scores: Vec<f32>,
+    specimen_best_evidence: Vec<u32>,
+    generation: u32,
+    touched_specimens: Vec<SpecimenId>,
+    cluster_matches: Vec<ClusterMatch>,
+}
+
+impl CompactMatchScratch {
+    fn clear_evidence(&mut self) {
+        self.evidence.clear();
+    }
+
+    fn score_evidence(
+        &mut self,
+        specimen_count: usize,
+        threshold: &DetectionThreshold,
+        bonus: f32,
+    ) {
+        self.specimen_generations.resize(specimen_count, 0);
+        self.specimen_scores.resize(specimen_count, 0.0);
+        self.specimen_best_evidence.resize(specimen_count, 0);
+        self.touched_specimens.clear();
+        self.cluster_matches.clear();
+        self.generation = next_generation(&mut self.specimen_generations, self.generation);
+
+        for evidence_index in 0..self.evidence.len() {
+            let evidence = self.evidence[evidence_index];
+            let specimen_index = evidence.specimen_id as usize;
+            debug_assert!(specimen_index < specimen_count);
+            if self.specimen_generations[specimen_index] != self.generation {
+                self.specimen_generations[specimen_index] = self.generation;
+                self.specimen_scores[specimen_index] = bonus;
+                self.specimen_best_evidence[specimen_index] = evidence_index as u32;
+                self.touched_specimens.push(evidence.specimen_id);
+            }
+            self.specimen_scores[specimen_index] +=
+                evidence.stage_score * stage_weight(evidence.confidence, threshold);
+            let best_index = self.specimen_best_evidence[specimen_index] as usize;
+            if evidence.stage_score > self.evidence[best_index].stage_score {
+                self.specimen_best_evidence[specimen_index] = evidence_index as u32;
+            }
+        }
+    }
+
+    fn winner(
+        &mut self,
+        specimen_count: usize,
+        search: ThresholdSearch<'_>,
+        cluster_scorer: Option<&mut ClusterScorer>,
+        graph: &CoherenceGraph,
+    ) -> Option<CompactWinner> {
+        let threshold = search.threshold;
+        let visual_bonus = search
+            .suspicious
+            .then(|| {
+                search
+                    .visual_shape
+                    .map(|evidence| visual_shape_score(evidence, threshold))
+            })
+            .flatten()
+            .map_or(0.0, |score| {
+                (score * threshold.visual_shape_score_weight).min(threshold.visual_shape_score_cap)
+            });
+        self.score_evidence(specimen_count, threshold, visual_bonus);
+
+        if search.suspicious
+            && threshold.cluster_coherence
+            && graph.num_specimens() > 0
+            && let Some(scorer) = cluster_scorer
+        {
+            let mut best: Option<CompactWinner> = None;
+            for &specimen_id in &self.touched_specimens {
+                let index = specimen_id as usize;
+                let score = self.specimen_scores[index];
+                if score <= 0.0 {
+                    continue;
+                }
+                self.cluster_matches.push(ClusterMatch {
+                    id: specimen_id,
+                    inliers: score.round().max(0.0) as u32,
+                    coverage_permille: 1_000,
+                });
+                if best.is_none_or(|winner| score > winner.score) {
+                    best = Some(self.compact_winner(index, MatchConfidence::ClusterCoherence));
+                }
+            }
+            if !self.cluster_matches.is_empty()
+                && matches!(
+                    scorer.score(&self.cluster_matches, graph),
+                    ClusterDecision::HardAct(HardActReason::CoherentCluster { .. })
+                )
+            {
+                return best.map(|mut winner| {
+                    winner.score = winner.score.max(threshold.cluster_hard_score as f32);
+                    winner
+                });
+            }
+        }
+
+        let mut best: Option<CompactWinner> = None;
+        for &specimen_id in &self.touched_specimens {
+            let index = specimen_id as usize;
+            let score = self.specimen_scores[index];
+            if best.is_none_or(|winner| score >= winner.score) {
+                best = Some(self.compact_winner(
+                    index,
+                    self.evidence[self.specimen_best_evidence[index] as usize].confidence,
+                ));
+            }
+        }
+        best.filter(|winner| winner.score >= threshold.score_threshold)
+    }
+
+    fn compact_winner(&self, specimen_index: usize, confidence: MatchConfidence) -> CompactWinner {
+        CompactWinner {
+            evidence: self.evidence[self.specimen_best_evidence[specimen_index] as usize],
+            score: self.specimen_scores[specimen_index],
+            confidence,
+        }
+    }
+}
+
+impl LocalCandidateScratch {
+    fn begin(&mut self, reference_count: usize, specimen_count: usize) {
+        self.query_buckets.clear();
+        self.seen_pairs.clear();
+        self.seen_votes.clear();
+        self.touched_references.clear();
+        self.touched_specimens.clear();
+        self.ranked.clear();
+
+        self.reference_generations.resize(reference_count, 0);
+        self.reference_hits
+            .resize_with(reference_count, BestReferenceHit::empty);
+        self.reference_generation =
+            next_generation(&mut self.reference_generations, self.reference_generation);
+
+        self.specimen_generations.resize(specimen_count, 0);
+        self.specimen_hits.resize(specimen_count, 0);
+        self.specimen_votes.resize(specimen_count, 0);
+        self.specimen_quality.resize(specimen_count, 0);
+        self.specimen_generation =
+            next_generation(&mut self.specimen_generations, self.specimen_generation);
+    }
+
+    fn reference_hit(&mut self, reference_id: ReferenceId) -> &mut BestReferenceHit {
+        let index = reference_id as usize;
+        debug_assert!(index < self.reference_hits.len());
+        if self.reference_generations[index] != self.reference_generation {
+            self.reference_generations[index] = self.reference_generation;
+            self.reference_hits[index] = BestReferenceHit::empty();
+            self.touched_references.push(reference_id);
+        }
+        &mut self.reference_hits[index]
+    }
+
+    fn record_vote(&mut self, candidate_id: u32, specimen_id: SpecimenId) {
+        if !self
+            .seen_votes
+            .insert(pack_u32_pair(candidate_id, specimen_id))
+        {
+            return;
+        }
+        let index = specimen_id as usize;
+        self.touch_specimen(specimen_id);
+        self.specimen_votes[index] = self.specimen_votes[index].saturating_add(1);
+    }
+
+    fn touch_specimen(&mut self, specimen_id: SpecimenId) {
+        let index = specimen_id as usize;
+        debug_assert!(index < self.specimen_generations.len());
+        if self.specimen_generations[index] == self.specimen_generation {
+            return;
+        }
+        self.specimen_generations[index] = self.specimen_generation;
+        self.specimen_hits[index] = 0;
+        self.specimen_votes[index] = 0;
+        self.specimen_quality[index] = 0;
+        self.touched_specimens.push(specimen_id);
+    }
+
+    fn rank(
+        &mut self,
+        reference_specimen: impl Fn(ReferenceId) -> Option<SpecimenId>,
+        limit: usize,
+    ) -> Vec<usize> {
+        for position in 0..self.touched_references.len() {
+            let reference_id = self.touched_references[position];
+            let Some(specimen_id) = reference_specimen(reference_id) else {
+                continue;
+            };
+            let Some(quality) = self.reference_hits[reference_id as usize]
+                .best
+                .map(|hit| hit.quality)
+            else {
+                continue;
+            };
+            self.touch_specimen(specimen_id);
+            let specimen_index = specimen_id as usize;
+            self.specimen_hits[specimen_index] += 1;
+            self.specimen_quality[specimen_index] =
+                self.specimen_quality[specimen_index].saturating_add(u64::from(quality));
+        }
+        self.ranked.extend(self.touched_specimens.iter().map(|id| {
+            let index = *id as usize;
+            (
+                index,
+                self.specimen_hits[index],
+                self.specimen_votes[index],
+                self.specimen_quality[index],
+            )
+        }));
+        self.ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.3.cmp(&right.3))
+        });
+        self.ranked
+            .iter()
+            .take(limit)
+            .map(|entry| entry.0)
+            .collect()
+    }
+}
+
+fn next_generation(generations: &mut [u32], generation: u32) -> u32 {
+    let generation = generation.wrapping_add(1);
+    if generation == 0 {
+        generations.fill(0);
+        1
+    } else {
+        generation
+    }
+}
+
+const fn pack_u32_pair(left: u32, right: u32) -> u64 {
+    ((left as u64) << 32) | right as u64
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PerceptualHashKind {
+    PHash,
+    DHash,
+}
+
+#[derive(Default)]
+struct PerceptualCandidateCache {
+    key: Option<(MatchVariant, PerceptualHashKind, u64)>,
+    seen_generation: Vec<u32>,
+    generation: u32,
+    indices: Vec<SpecimenId>,
+}
+
+impl PerceptualCandidateCache {
+    fn collect(
+        &mut self,
+        key: (MatchVariant, PerceptualHashKind, u64),
+        index: &matcher_opt::FlatSegmentIndex<SpecimenId>,
+        specimen_count: usize,
+    ) {
+        if self.key == Some(key) {
+            return;
+        }
+        self.key = Some(key);
+        self.indices.clear();
+        self.seen_generation.resize(specimen_count, 0);
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.seen_generation.fill(0);
+            self.generation = 1;
+        }
+        for slot in matcher_opt::hamming_segments_flat(key.2) {
+            for &specimen_id in index.get(slot) {
+                let specimen_index = specimen_id as usize;
+                debug_assert!(specimen_index < specimen_count);
+                if self.seen_generation[specimen_index] != self.generation {
+                    self.seen_generation[specimen_index] = self.generation;
+                    self.indices.push(specimen_id);
+                }
+            }
+        }
+    }
+}
+
+enum PerceptualCandidates<'a> {
+    All(std::ops::Range<usize>),
+    Indexed(std::slice::Iter<'a, SpecimenId>),
+    Empty,
+}
+
+impl Iterator for PerceptualCandidates<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::All(indices) => indices.next(),
+            Self::Indexed(indices) => indices.next().map(|index| *index as usize),
+            Self::Empty => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -566,47 +990,54 @@ impl LocalMatchStage {
     }
 }
 
+struct SpecimenIndexWriter<'a> {
+    phash: &'a mut matcher_opt::FlatSegmentIndex<SpecimenId>,
+    dhash: &'a mut matcher_opt::FlatSegmentIndex<SpecimenId>,
+    anchors: &'a mut matcher_opt::FlatSegmentIndex<ReferenceId>,
+    anchor_references: &'a mut Vec<IndexedAnchorRef>,
+    dense_local: &'a mut matcher_opt::FlatSegmentIndex<ReferenceId>,
+    dense_local_references: &'a mut Vec<IndexedDenseLocalRef>,
+}
+
 fn index_specimen(
     specimen: &IndexedSpecimen,
     specimen_index: usize,
-    phash_index: &mut matcher_opt::FlatSegmentIndex<usize>,
-    dhash_index: &mut matcher_opt::FlatSegmentIndex<usize>,
-    anchor_index: &mut matcher_opt::FlatSegmentIndex<IndexedAnchorRef>,
-    dense_local_index: &mut matcher_opt::FlatSegmentIndex<IndexedDenseLocalRef>,
+    perceptual_hashes: &[PerceptualHashes],
+    indexes: &mut SpecimenIndexWriter<'_>,
 ) {
-    if let Some(phash64) = specimen.phash64 {
+    let specimen_id = specimen_index as SpecimenId;
+    let perceptual = perceptual_hashes.get(specimen.perceptual_hash_id as usize);
+    if let Some(phash64) = perceptual.and_then(|hashes| hashes.phash64) {
         for slot in matcher_opt::hamming_segments_flat(phash64) {
-            phash_index.push(slot, specimen_index);
+            indexes.phash.push(slot, specimen_id);
         }
     }
-    if let Some(dhash64) = specimen.dhash64 {
+    if let Some(dhash64) = perceptual.and_then(|hashes| hashes.dhash64) {
         for slot in matcher_opt::hamming_segments_flat(dhash64) {
-            dhash_index.push(slot, specimen_index);
+            indexes.dhash.push(slot, specimen_id);
         }
     }
     for (anchor_position, anchor) in specimen.anchors.iter().enumerate() {
+        let reference_id = indexes.anchor_references.len() as ReferenceId;
+        indexes.anchor_references.push(IndexedAnchorRef {
+            specimen_index: specimen_id,
+            anchor_index: anchor_position as u32,
+        });
         for slot in matcher_opt::hamming_segments_flat(anchor.hash) {
-            anchor_index.push(
-                slot,
-                IndexedAnchorRef {
-                    specimen_index,
-                    anchor_index: anchor_position,
-                },
-            );
+            indexes.anchors.push(slot, reference_id);
         }
     }
     for (dense_position, dense_anchor) in specimen.dense_local_anchors.iter().enumerate() {
         if dense_anchor.rotation_degrees != 0 {
             continue;
         }
+        let reference_id = indexes.dense_local_references.len() as ReferenceId;
+        indexes.dense_local_references.push(IndexedDenseLocalRef {
+            specimen_index: specimen_id,
+            dense_local_index: dense_position as u32,
+        });
         for slot in matcher_opt::dense_local_segments_flat(dense_anchor.hash) {
-            dense_local_index.push(
-                slot,
-                IndexedDenseLocalRef {
-                    specimen_index,
-                    dense_local_index: dense_position,
-                },
-            );
+            indexes.dense_local.push(slot, reference_id);
         }
     }
 }
@@ -616,6 +1047,7 @@ impl Default for Matcher {
         Self {
             specimens: Vec::new(),
             preview_specimens: Vec::new(),
+            perceptual_hashes: Vec::new(),
             xxh128_index: HashMap::default(),
             preview_xxh128_index: HashMap::default(),
             phash_segment_index: matcher_opt::FlatSegmentIndex::with_slots(
@@ -642,6 +1074,10 @@ impl Default for Matcher {
             preview_dense_local_segment_index: matcher_opt::FlatSegmentIndex::with_slots(
                 matcher_opt::DENSE_LOCAL_FLAT_SLOTS,
             ),
+            anchor_references: Vec::new(),
+            preview_anchor_references: Vec::new(),
+            dense_local_references: Vec::new(),
+            preview_dense_local_references: Vec::new(),
             specimen_id_index: HashMap::default(),
             preview_specimen_id_index: HashMap::default(),
             coherence_graph: CoherenceGraph::default(),
@@ -666,58 +1102,17 @@ impl Matcher {
         matcher
     }
 
-    pub fn add_with_policy(&mut self, specimen: SpecimenRecord, policy: Option<&DetectionPolicy>) {
+    pub fn add_batch_with_policy(
+        &mut self,
+        specimens: impl IntoIterator<Item = SpecimenRecord>,
+        policy: Option<&DetectionPolicy>,
+    ) {
         if let Some(policy) = policy {
             self.set_coherence_policy(policy);
         }
-        let specimen = IndexedSpecimen::new(specimen);
-        let index = self.specimens.len();
-        if let Some(byte_xxh128) = specimen.byte_xxh128 {
-            self.xxh128_index.insert(byte_xxh128, index);
-        }
-        self.specimen_id_index
-            .insert(specimen.record.specimen_id.clone(), index as SpecimenId);
-        index_specimen(
-            &specimen,
-            index,
-            &mut self.phash_segment_index,
-            &mut self.dhash_segment_index,
-            &mut self.anchor_segment_index,
-            &mut self.dense_local_segment_index,
-        );
-        self.specimens.push(specimen);
-        self.coherence_graph = append_coherence_graph(
-            &self.coherence_graph,
-            &self.specimens,
-            index,
-            &self.coherence_threshold,
-        );
-
-        if let Some(preview) = IndexedSpecimen::new_preview(&self.specimens[index].record) {
-            let preview_index = self.preview_specimens.len();
-            if let Some(byte_xxh128) = preview.byte_xxh128 {
-                self.preview_xxh128_index.insert(byte_xxh128, preview_index);
-            }
-            self.preview_specimen_id_index.insert(
-                preview.record.specimen_id.clone(),
-                preview_index as SpecimenId,
-            );
-            index_specimen(
-                &preview,
-                preview_index,
-                &mut self.preview_phash_segment_index,
-                &mut self.preview_dhash_segment_index,
-                &mut self.preview_anchor_segment_index,
-                &mut self.preview_dense_local_segment_index,
-            );
-            self.preview_specimens.push(preview);
-            self.preview_coherence_graph = append_coherence_graph(
-                &self.preview_coherence_graph,
-                &self.preview_specimens,
-                preview_index,
-                &self.coherence_threshold,
-            );
-        }
+        self.specimens
+            .extend(specimens.into_iter().map(IndexedSpecimen::new));
+        self.rebuild_indexes();
     }
 
     pub fn len(&self) -> usize {
@@ -727,7 +1122,7 @@ impl Matcher {
     pub fn records(&self) -> Vec<SpecimenRecord> {
         self.specimens
             .iter()
-            .map(|specimen| specimen.record.clone())
+            .map(|specimen| specimen.record.as_ref().clone())
             .collect()
     }
 
@@ -775,9 +1170,16 @@ impl Matcher {
             return;
         }
         self.coherence_threshold = threshold;
-        self.coherence_graph = build_coherence_graph(&self.specimens, &self.coherence_threshold);
-        self.preview_coherence_graph =
-            build_coherence_graph(&self.preview_specimens, &self.coherence_threshold);
+        self.coherence_graph = build_coherence_graph(
+            &self.specimens,
+            &self.perceptual_hashes,
+            &self.coherence_threshold,
+        );
+        self.preview_coherence_graph = build_coherence_graph(
+            &self.preview_specimens,
+            &self.perceptual_hashes,
+            &self.coherence_threshold,
+        );
     }
 
     fn rebuild_indexes(&mut self) {
@@ -786,16 +1188,40 @@ impl Matcher {
         self.phash_segment_index.clear();
         self.dhash_segment_index.clear();
         self.anchor_segment_index.clear();
+        self.anchor_references.clear();
         self.preview_specimens.clear();
         self.preview_phash_segment_index.clear();
         self.preview_dhash_segment_index.clear();
         self.preview_anchor_segment_index.clear();
+        self.preview_anchor_references.clear();
         self.dense_local_segment_index.clear();
+        self.dense_local_references.clear();
         self.preview_dense_local_segment_index.clear();
+        self.preview_dense_local_references.clear();
         self.specimen_id_index.clear();
         self.preview_specimen_id_index.clear();
+        self.perceptual_hashes.clear();
 
-        for (index, specimen) in self.specimens.iter().enumerate() {
+        let mut perceptual_interner = HashMap::default();
+        let mut visual_interner = HashMap::default();
+        let mut anchor_interner = HashMap::default();
+        let mut dense_local_interner = HashMap::default();
+
+        for index in 0..self.specimens.len() {
+            let specimen = &mut self.specimens[index];
+            specimen.perceptual_hash_id = intern_perceptual_hashes(
+                PerceptualHashes::parse(
+                    &specimen.record.image.phash64,
+                    &specimen.record.image.dhash64,
+                ),
+                &mut self.perceptual_hashes,
+                &mut perceptual_interner,
+            );
+            intern_value(&mut specimen.visual, &mut visual_interner);
+            intern_slice(&mut specimen.anchors, &mut anchor_interner);
+            intern_slice(&mut specimen.dense_local_anchors, &mut dense_local_interner);
+
+            let specimen = &self.specimens[index];
             if let Some(byte_xxh128) = specimen.byte_xxh128 {
                 self.xxh128_index.insert(byte_xxh128, index);
             }
@@ -804,12 +1230,26 @@ impl Matcher {
             index_specimen(
                 specimen,
                 index,
-                &mut self.phash_segment_index,
-                &mut self.dhash_segment_index,
-                &mut self.anchor_segment_index,
-                &mut self.dense_local_segment_index,
+                &self.perceptual_hashes,
+                &mut SpecimenIndexWriter {
+                    phash: &mut self.phash_segment_index,
+                    dhash: &mut self.dhash_segment_index,
+                    anchors: &mut self.anchor_segment_index,
+                    anchor_references: &mut self.anchor_references,
+                    dense_local: &mut self.dense_local_segment_index,
+                    dense_local_references: &mut self.dense_local_references,
+                },
             );
-            if let Some(preview) = IndexedSpecimen::new_preview(&specimen.record) {
+            if let Some(mut preview) = IndexedSpecimen::new_preview(&specimen.record) {
+                let preview_record = preview.record.preview.as_ref().expect("preview exists");
+                preview.perceptual_hash_id = intern_perceptual_hashes(
+                    PerceptualHashes::parse(&preview_record.phash64, &preview_record.dhash64),
+                    &mut self.perceptual_hashes,
+                    &mut perceptual_interner,
+                );
+                intern_value(&mut preview.visual, &mut visual_interner);
+                intern_slice(&mut preview.anchors, &mut anchor_interner);
+                intern_slice(&mut preview.dense_local_anchors, &mut dense_local_interner);
                 let preview_index = self.preview_specimens.len();
                 if let Some(byte_xxh128) = preview.byte_xxh128 {
                     self.preview_xxh128_index.insert(byte_xxh128, preview_index);
@@ -821,17 +1261,29 @@ impl Matcher {
                 index_specimen(
                     &preview,
                     preview_index,
-                    &mut self.preview_phash_segment_index,
-                    &mut self.preview_dhash_segment_index,
-                    &mut self.preview_anchor_segment_index,
-                    &mut self.preview_dense_local_segment_index,
+                    &self.perceptual_hashes,
+                    &mut SpecimenIndexWriter {
+                        phash: &mut self.preview_phash_segment_index,
+                        dhash: &mut self.preview_dhash_segment_index,
+                        anchors: &mut self.preview_anchor_segment_index,
+                        anchor_references: &mut self.preview_anchor_references,
+                        dense_local: &mut self.preview_dense_local_segment_index,
+                        dense_local_references: &mut self.preview_dense_local_references,
+                    },
                 );
                 self.preview_specimens.push(preview);
             }
         }
-        self.coherence_graph = build_coherence_graph(&self.specimens, &self.coherence_threshold);
-        self.preview_coherence_graph =
-            build_coherence_graph(&self.preview_specimens, &self.coherence_threshold);
+        self.coherence_graph = build_coherence_graph(
+            &self.specimens,
+            &self.perceptual_hashes,
+            &self.coherence_threshold,
+        );
+        self.preview_coherence_graph = build_coherence_graph(
+            &self.preview_specimens,
+            &self.perceptual_hashes,
+            &self.coherence_threshold,
+        );
     }
 
     pub fn find_for_policy(
@@ -839,8 +1291,22 @@ impl Matcher {
         image: &ImageFingerprint,
         policy: &DetectionPolicy,
     ) -> Option<MatchOutcome> {
-        self.explain_for_policy_with_mode(image, policy, MatchEvaluationMode::ShortCircuit)
-            .outcome
+        self.find_for_policy_with_scratch(image, policy, &mut MatcherScratch::default())
+    }
+
+    pub(crate) fn find_for_policy_with_scratch(
+        &self,
+        image: &ImageFingerprint,
+        policy: &DetectionPolicy,
+        scratch: &mut MatcherScratch,
+    ) -> Option<MatchOutcome> {
+        let policy = self.policy_with_compatible_coherence(policy);
+        self.find_for_policy_variant_fast(
+            image,
+            policy.as_ref(),
+            MatchVariant::Original,
+            &mut scratch.evaluation,
+        )
     }
 
     pub fn explain_for_policy_with_mode(
@@ -849,21 +1315,408 @@ impl Matcher {
         policy: &DetectionPolicy,
         mode: MatchEvaluationMode,
     ) -> MatchExplanation {
-        self.explain_for_policy_variant(image, policy, MatchVariant::Original, mode)
+        let policy = self.policy_with_compatible_coherence(policy);
+        self.explain_for_policy_variant(image, policy.as_ref(), MatchVariant::Original, mode)
     }
 
-    pub fn find_preview_for_policy(
+    pub(crate) fn find_preview_for_policy_with_scratch(
         &self,
         image: &ImageFingerprint,
         policy: &DetectionPolicy,
+        scratch: &mut MatcherScratch,
     ) -> Option<MatchOutcome> {
-        self.explain_for_policy_variant(
+        let policy = self.policy_with_compatible_coherence(policy);
+        self.find_for_policy_variant_fast(
             image,
-            policy,
+            policy.as_ref(),
             MatchVariant::DiscordPreview,
-            MatchEvaluationMode::ShortCircuit,
+            &mut scratch.evaluation,
         )
-        .outcome
+    }
+
+    fn policy_with_compatible_coherence<'a>(
+        &self,
+        policy: &'a DetectionPolicy,
+    ) -> Cow<'a, DetectionPolicy> {
+        if policy.suspicious.threshold == self.coherence_threshold {
+            return Cow::Borrowed(policy);
+        }
+        let mut safe = policy.clone();
+        safe.confirmed.threshold.cluster_coherence = false;
+        safe.suspicious.threshold.cluster_coherence = false;
+        Cow::Owned(safe)
+    }
+
+    fn find_for_policy_variant_fast(
+        &self,
+        image: &ImageFingerprint,
+        policy: &DetectionPolicy,
+        variant: MatchVariant,
+        cache: &mut MatchEvaluationCache,
+    ) -> Option<MatchOutcome> {
+        cache.reset();
+        let candidate = ParsedCandidate::from_image(image);
+        self.find_for_threshold_compact(
+            &candidate,
+            ThresholdInput {
+                threshold: &policy.confirmed.threshold,
+                suspicious: false,
+                name: "confirmed",
+                variant,
+            },
+            cache,
+        )
+        .or_else(|| {
+            self.find_for_threshold_compact(
+                &candidate,
+                ThresholdInput {
+                    threshold: &policy.suspicious.threshold,
+                    suspicious: true,
+                    name: "suspicious",
+                    variant,
+                },
+                cache,
+            )
+        })
+    }
+
+    fn find_for_threshold_compact(
+        &self,
+        candidate: &ParsedCandidate,
+        input: ThresholdInput<'_>,
+        cache: &mut MatchEvaluationCache,
+    ) -> Option<MatchOutcome> {
+        let threshold = input.threshold;
+        if threshold.exact_xxh128
+            && let Some(specimen) =
+                self.exact_specimen_by_xxh128(candidate.byte_xxh128, input.variant)
+        {
+            return Some(exact_outcome_compact(specimen, candidate, input));
+        }
+
+        let visual_shape = threshold
+            .visual_shape
+            .then(|| visual_shape_evidence(candidate, threshold))
+            .flatten();
+        let search = ThresholdSearch {
+            threshold,
+            suspicious: input.suspicious,
+            name: input.name,
+            variant: input.variant,
+            visual_shape,
+        };
+        cache.compact.clear_evidence();
+
+        if threshold.perceptual_hash {
+            self.collect_perceptual_evidence(candidate, search, cache);
+            if !input.suspicious
+                && let Some(winner) = cache.compact.winner(
+                    self.variant_specimens(input.variant).len(),
+                    search,
+                    None,
+                    self.variant_coherence_graph(input.variant),
+                )
+            {
+                return Some(self.materialize_compact_winner(candidate, input, winner));
+            }
+        }
+
+        if threshold.local_anchors {
+            self.collect_local_evidence(candidate, search, LocalMatchStage::Anchors, cache);
+            if !input.suspicious
+                && let Some(winner) = cache.compact.winner(
+                    self.variant_specimens(input.variant).len(),
+                    search,
+                    None,
+                    self.variant_coherence_graph(input.variant),
+                )
+            {
+                return Some(self.materialize_compact_winner(candidate, input, winner));
+            }
+
+            self.collect_local_evidence(
+                candidate,
+                search,
+                LocalMatchStage::DenseLocalAnchors,
+                cache,
+            );
+            if !input.suspicious
+                && let Some(winner) = cache.compact.winner(
+                    self.variant_specimens(input.variant).len(),
+                    search,
+                    None,
+                    self.variant_coherence_graph(input.variant),
+                )
+            {
+                return Some(self.materialize_compact_winner(candidate, input, winner));
+            }
+        }
+
+        let mut cluster_scorer = threshold.cluster_coherence.then(|| {
+            ClusterScorer::new(ClusterThresholds::new(
+                threshold.cluster_chrome_ceiling_score,
+                threshold.cluster_hard_score,
+                threshold.cluster_member_score,
+                threshold.cluster_coverage_floor_permille,
+                threshold.cluster_coherence_score,
+                threshold.cluster_min_size,
+            ))
+        });
+        let winner = cache.compact.winner(
+            self.variant_specimens(input.variant).len(),
+            search,
+            cluster_scorer.as_mut(),
+            self.variant_coherence_graph(input.variant),
+        )?;
+        Some(self.materialize_compact_winner(candidate, input, winner))
+    }
+
+    fn collect_perceptual_evidence(
+        &self,
+        candidate: &ParsedCandidate,
+        search: ThresholdSearch<'_>,
+        cache: &mut MatchEvaluationCache,
+    ) {
+        let threshold = search.threshold;
+        let mut considered = 0usize;
+        for specimen_index in self.perceptual_candidates(
+            candidate,
+            threshold.phash64_max_distance,
+            threshold.dhash64_max_distance,
+            search.variant,
+            &mut cache.perceptual_candidates,
+        ) {
+            let Some(specimen) = self.variant_specimens(search.variant).get(specimen_index) else {
+                continue;
+            };
+            considered += 1;
+            let (phash64_distance, dhash64_distance) =
+                hash_distances(self.perceptual_hashes_for(specimen), candidate);
+            let hash_compatible = phash64_distance.zip(dhash64_distance).is_some_and(
+                |(phash_distance, dhash_distance)| {
+                    perceptual_hash_compatible_for_threshold(
+                        phash_distance,
+                        dhash_distance,
+                        threshold,
+                    )
+                },
+            );
+            let geometry_compatible =
+                fingerprint_geometry_compatible(specimen.geometry, candidate.geometry, threshold);
+            let passed = hash_compatible && geometry_compatible;
+            let visual_supported_near_miss = search.suspicious
+                && search.visual_shape.is_some()
+                && !passed
+                && phash64_distance.zip(dhash64_distance).is_some_and(
+                    |(phash_distance, dhash_distance)| {
+                        perceptual_hash_visually_supported(
+                            phash_distance,
+                            dhash_distance,
+                            hash_compatible,
+                            geometry_compatible,
+                            threshold,
+                        )
+                    },
+                );
+            if !passed && !visual_supported_near_miss {
+                continue;
+            }
+            let visual_score =
+                visual_signature_score(&specimen.visual, &candidate.visual, threshold);
+            let Some(stage_score) = phash64_distance.zip(dhash64_distance).map(|distances| {
+                stage_score_with_visual(
+                    perceptual_score(distances, threshold),
+                    visual_score,
+                    threshold,
+                )
+            }) else {
+                continue;
+            };
+            cache.compact.evidence.push(CompactEvidence {
+                specimen_id: specimen_index as SpecimenId,
+                confidence: if search.suspicious {
+                    MatchConfidence::SuspiciousPerceptual
+                } else {
+                    MatchConfidence::Perceptual
+                },
+                stage: CompactMatchStage::Perceptual,
+                stage_score,
+                phash64_distance,
+                dhash64_distance,
+                local: None,
+                candidates_considered: considered,
+                geometry_compatible: Some(geometry_compatible),
+                visual_compatible: Some(visual_score > 0.0),
+                reason: visual_supported_near_miss.then_some("visual_supported_near_miss"),
+            });
+        }
+    }
+
+    fn collect_local_evidence(
+        &self,
+        candidate: &ParsedCandidate,
+        search: ThresholdSearch<'_>,
+        stage: LocalMatchStage,
+        cache: &mut MatchEvaluationCache,
+    ) {
+        let threshold = search.threshold;
+        let indexed = match stage {
+            LocalMatchStage::Anchors => self.indexed_local_anchor_matches(
+                candidate,
+                threshold,
+                search.variant,
+                Some(self.cached_local_selection(candidate, search.variant, cache)),
+                cache,
+            ),
+            LocalMatchStage::DenseLocalAnchors => {
+                self.indexed_dense_local_anchor_matches(candidate, threshold, search.variant, cache)
+            }
+        };
+        let considered = indexed.selected_count;
+        for (specimen_index, local) in indexed.matches {
+            let Some(specimen) = self.variant_specimens(search.variant).get(specimen_index) else {
+                continue;
+            };
+            let geometry_compatible =
+                fingerprint_geometry_compatible(specimen.geometry, candidate.geometry, threshold);
+            let verified_local_transform = local.geometry_model.is_some();
+            if !geometry_compatible && !verified_local_transform {
+                continue;
+            }
+            let visual_score =
+                visual_signature_score(&specimen.visual, &candidate.visual, threshold);
+            let (phash64_distance, dhash64_distance) =
+                hash_distances(self.perceptual_hashes_for(specimen), candidate);
+            cache.compact.evidence.push(CompactEvidence {
+                specimen_id: specimen_index as SpecimenId,
+                confidence: stage.confidence(search.suspicious),
+                stage: match stage {
+                    LocalMatchStage::Anchors => CompactMatchStage::Anchors,
+                    LocalMatchStage::DenseLocalAnchors => CompactMatchStage::DenseLocalAnchors,
+                },
+                stage_score: stage_score_with_visual(
+                    local_anchor_score(&local, threshold),
+                    visual_score,
+                    threshold,
+                ),
+                phash64_distance,
+                dhash64_distance,
+                local: Some(local),
+                candidates_considered: considered,
+                geometry_compatible: Some(geometry_compatible),
+                visual_compatible: Some(visual_score > 0.0),
+                reason: (!geometry_compatible).then_some("verified_local_geometry"),
+            });
+        }
+
+        if !search.suspicious
+            || !matches!(stage, LocalMatchStage::Anchors)
+            || search.visual_shape.is_none()
+        {
+            return;
+        }
+        for (specimen_index, support) in indexed.support_matches {
+            let Some(specimen) = self.variant_specimens(search.variant).get(specimen_index) else {
+                continue;
+            };
+            if !local_unverified_support_passes(
+                specimen,
+                self.perceptual_hashes_for(specimen),
+                candidate,
+                &support,
+                threshold,
+            ) {
+                continue;
+            }
+            let local = support.comparison;
+            let visual_score =
+                visual_signature_score(&specimen.visual, &candidate.visual, threshold);
+            let (phash64_distance, dhash64_distance) =
+                hash_distances(self.perceptual_hashes_for(specimen), candidate);
+            cache.compact.evidence.push(CompactEvidence {
+                specimen_id: specimen_index as SpecimenId,
+                confidence: MatchConfidence::SuspiciousLocalAnchors,
+                stage: CompactMatchStage::Anchors,
+                stage_score: stage_score_with_visual(
+                    local_anchor_score(&local, threshold),
+                    visual_score,
+                    threshold,
+                ),
+                phash64_distance,
+                dhash64_distance,
+                local: Some(local),
+                candidates_considered: considered,
+                geometry_compatible: Some(true),
+                visual_compatible: Some(visual_score > 0.0),
+                reason: Some("unverified_local_support"),
+            });
+        }
+    }
+
+    fn materialize_compact_winner(
+        &self,
+        candidate: &ParsedCandidate,
+        input: ThresholdInput<'_>,
+        winner: CompactWinner,
+    ) -> MatchOutcome {
+        let specimen = &self.variant_specimens(input.variant)[winner.evidence.specimen_id as usize];
+        let mut diagnostics = match_diagnostics_for_candidate(candidate, input.variant);
+        let local = winner.evidence.local;
+        let visual_shape = input
+            .threshold
+            .visual_shape
+            .then(|| visual_shape_evidence(candidate, input.threshold))
+            .flatten();
+        diagnostics.steps.push(MatchStepDiagnostic {
+            threshold: input.name,
+            step: if matches!(winner.confidence, MatchConfidence::ClusterCoherence) {
+                "cluster_coherence"
+            } else {
+                match winner.evidence.stage {
+                    CompactMatchStage::Perceptual => "perceptual_hash",
+                    CompactMatchStage::Anchors => LocalMatchStage::Anchors.step(input.suspicious),
+                    CompactMatchStage::DenseLocalAnchors => {
+                        LocalMatchStage::DenseLocalAnchors.step(input.suspicious)
+                    }
+                }
+            },
+            passed: true,
+            reason: if matches!(winner.confidence, MatchConfidence::ClusterCoherence) {
+                Some("coherent_cluster")
+            } else {
+                winner.evidence.reason
+            },
+            specimen_id: Some(specimen.record.specimen_id.clone()),
+            candidates_considered: Some(winner.evidence.candidates_considered),
+            phash64_distance: winner.evidence.phash64_distance,
+            dhash64_distance: winner.evidence.dhash64_distance,
+            geometry_compatible: winner.evidence.geometry_compatible,
+            visual_compatible: winner.evidence.visual_compatible,
+            local_anchor_hits: local.map(|comparison| comparison.hits),
+            local_distinct_regions: local.map(|comparison| comparison.distinct_regions),
+            local_average_distance: local.and_then(|comparison| comparison.average_distance),
+            local_layout_spread: local.and_then(|comparison| comparison.layout_spread),
+            local_mean_residual: local.and_then(|comparison| comparison.mean_residual),
+            local_scale: local.and_then(|comparison| comparison.scale),
+            local_angle: local.and_then(|comparison| comparison.angle),
+            local_geometry_model: local.and_then(|comparison| comparison.geometry_model),
+            visual_shape_signals: visual_shape.map(|evidence| evidence.signals),
+            visual_shape_score: visual_shape.map(|evidence| evidence.score),
+            match_score: Some(winner.score),
+        });
+        MatchOutcome {
+            specimen_id: specimen.record.specimen_id.clone(),
+            confidence: winner.confidence,
+            suspicious: input.suspicious,
+            match_score: Some(winner.score),
+            phash64_distance: winner.evidence.phash64_distance,
+            dhash64_distance: winner.evidence.dhash64_distance,
+            local_anchor_hits: local.map(|comparison| comparison.hits),
+            local_distinct_regions: local.map(|comparison| comparison.distinct_regions),
+            local_average_distance: local.and_then(|comparison| comparison.average_distance),
+            local_geometry_model: local.and_then(|comparison| comparison.geometry_model),
+            diagnostics,
+        }
     }
 
     fn explain_for_policy_variant(
@@ -873,9 +1726,26 @@ impl Matcher {
         variant: MatchVariant,
         mode: MatchEvaluationMode,
     ) -> MatchExplanation {
+        self.explain_for_policy_variant_with_cache(
+            image,
+            policy,
+            variant,
+            mode,
+            &mut MatchEvaluationCache::default(),
+        )
+    }
+
+    fn explain_for_policy_variant_with_cache(
+        &self,
+        image: &ImageFingerprint,
+        policy: &DetectionPolicy,
+        variant: MatchVariant,
+        mode: MatchEvaluationMode,
+        cache: &mut MatchEvaluationCache,
+    ) -> MatchExplanation {
+        cache.reset();
         let candidate = ParsedCandidate::from_image(image);
         let mut diagnostics = match_diagnostics_for_candidate(&candidate, variant);
-        let mut cache = MatchEvaluationCache::default();
         let mut outcome = if mode == MatchEvaluationMode::ShortCircuit {
             self.find_for_threshold_parsed(
                 &candidate,
@@ -887,7 +1757,7 @@ impl Matcher {
                 },
                 mode,
                 &mut diagnostics,
-                &mut cache,
+                cache,
             )
             .or_else(|| {
                 self.find_for_threshold_parsed(
@@ -900,7 +1770,7 @@ impl Matcher {
                     },
                     mode,
                     &mut diagnostics,
-                    &mut cache,
+                    cache,
                 )
             })
         } else {
@@ -914,7 +1784,7 @@ impl Matcher {
                 },
                 mode,
                 &mut diagnostics,
-                &mut cache,
+                cache,
             );
             let suspicious = self.find_for_threshold_parsed(
                 &candidate,
@@ -926,7 +1796,7 @@ impl Matcher {
                 },
                 mode,
                 &mut diagnostics,
-                &mut cache,
+                cache,
             );
             confirmed.or(suspicious)
         };
@@ -996,7 +1866,12 @@ impl Matcher {
         let mut stage_outcomes = Vec::new();
 
         if threshold.perceptual_hash {
-            stage_outcomes.extend(self.find_perceptual_match(candidate, search, diagnostics));
+            stage_outcomes.extend(self.find_perceptual_match(
+                candidate,
+                search,
+                diagnostics,
+                cache,
+            ));
             if mode == MatchEvaluationMode::ShortCircuit
                 && !suspicious
                 && let Some(outcome) = self.scored_threshold_outcome(
@@ -1070,6 +1945,7 @@ impl Matcher {
         candidate: &ParsedCandidate,
         search: ThresholdSearch<'_>,
         diagnostics: &mut MatchDiagnostics,
+        cache: &mut MatchEvaluationCache,
     ) -> Vec<MatchOutcome> {
         let threshold = search.threshold;
         let suspicious = search.suspicious;
@@ -1086,11 +1962,13 @@ impl Matcher {
                 threshold.phash64_max_distance,
                 threshold.dhash64_max_distance,
                 variant,
+                &mut cache.perceptual_candidates,
             )
             .filter_map(|index| self.variant_specimens(variant).get(index))
         {
             considered += 1;
-            let (phash64_distance, dhash64_distance) = hash_distances(specimen, candidate);
+            let (phash64_distance, dhash64_distance) =
+                hash_distances(self.perceptual_hashes_for(specimen), candidate);
             let hash_compatible = phash64_distance.zip(dhash64_distance).is_some_and(
                 |(phash_distance, dhash_distance)| {
                     perceptual_hash_compatible_for_threshold(
@@ -1271,7 +2149,8 @@ impl Matcher {
             let visual_score =
                 visual_signature_score(&specimen.visual, &candidate.visual, threshold);
             let visual_compatible = visual_score > 0.0;
-            let (phash64_distance, dhash64_distance) = hash_distances(specimen, candidate);
+            let (phash64_distance, dhash64_distance) =
+                hash_distances(self.perceptual_hashes_for(specimen), candidate);
             let match_score = Some(stage_score_with_visual(
                 local_anchor_score(&local, threshold),
                 visual_score,
@@ -1335,13 +2214,20 @@ impl Matcher {
                 let Some(specimen) = self.variant_specimens(variant).get(specimen_index) else {
                     continue;
                 };
-                if !local_unverified_support_passes(specimen, candidate, &local, threshold) {
+                if !local_unverified_support_passes(
+                    specimen,
+                    self.perceptual_hashes_for(specimen),
+                    candidate,
+                    &local,
+                    threshold,
+                ) {
                     continue;
                 }
                 let local_comparison = &local.comparison;
                 let visual_score =
                     visual_signature_score(&specimen.visual, &candidate.visual, threshold);
-                let (phash64_distance, dhash64_distance) = hash_distances(specimen, candidate);
+                let (phash64_distance, dhash64_distance) =
+                    hash_distances(self.perceptual_hashes_for(specimen), candidate);
                 let match_score = Some(stage_score_with_visual(
                     local_anchor_score(local_comparison, threshold),
                     visual_score,
@@ -1425,19 +2311,20 @@ impl Matcher {
         outcomes
     }
 
-    fn perceptual_candidates(
-        &self,
+    fn perceptual_candidates<'a>(
+        &'a self,
         candidate: &ParsedCandidate,
         phash_max_distance: u32,
         dhash_max_distance: u32,
         variant: MatchVariant,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+        cache: &'a mut PerceptualCandidateCache,
+    ) -> PerceptualCandidates<'a> {
         let specimens = self.variant_specimens(variant);
 
         if phash_max_distance as u8 >= matcher_opt::HAMMING_INDEX_SEGMENTS
             && dhash_max_distance as u8 >= matcher_opt::HAMMING_INDEX_SEGMENTS
         {
-            return Box::new(0..specimens.len());
+            return PerceptualCandidates::All(0..specimens.len());
         }
 
         if phash_max_distance <= dhash_max_distance
@@ -1445,53 +2332,37 @@ impl Matcher {
             && (phash_max_distance as u8) < matcher_opt::HAMMING_INDEX_SEGMENTS
         {
             let index = self.variant_phash_index(variant);
-            return Box::new(Self::segment_index_candidates(
-                phash64,
+            cache.collect(
+                (variant, PerceptualHashKind::PHash, phash64),
                 index,
                 specimens.len(),
-            ));
+            );
+            return PerceptualCandidates::Indexed(cache.indices.iter());
         }
 
         if let Some(dhash64) = candidate.dhash64
             && (dhash_max_distance as u8) < matcher_opt::HAMMING_INDEX_SEGMENTS
         {
             let index = self.variant_dhash_index(variant);
-            return Box::new(Self::segment_index_candidates(
-                dhash64,
+            cache.collect(
+                (variant, PerceptualHashKind::DHash, dhash64),
                 index,
                 specimens.len(),
-            ));
+            );
+            return PerceptualCandidates::Indexed(cache.indices.iter());
         }
 
         let Some(phash64) = candidate.phash64 else {
-            return Box::new(std::iter::empty());
+            return PerceptualCandidates::Empty;
         };
         let index = self.variant_phash_index(variant);
-        Box::new(Self::segment_index_candidates(
-            phash64,
+        cache.collect(
+            (variant, PerceptualHashKind::PHash, phash64),
             index,
             specimens.len(),
-        ))
+        );
+        PerceptualCandidates::Indexed(cache.indices.iter())
     }
-
-    fn segment_index_candidates(
-        hash: u64,
-        index: &matcher_opt::FlatSegmentIndex<usize>,
-        specimen_count: usize,
-    ) -> std::vec::IntoIter<usize> {
-        let mut indices = Vec::new();
-        let mut seen = HashSet::default();
-        for slot in matcher_opt::hamming_segments_flat(hash) {
-            for &specimen_index in index.get(slot) {
-                debug_assert!(specimen_index < specimen_count);
-                if seen.insert(specimen_index) {
-                    indices.push(specimen_index);
-                }
-            }
-        }
-        indices.into_iter()
-    }
-
     fn indexed_local_anchor_matches(
         &self,
         candidate: &ParsedCandidate,
@@ -1508,7 +2379,12 @@ impl Matcher {
         }
         let limits = LocalThresholds::from_detection_threshold(threshold);
         let selection = selection.unwrap_or_else(|| {
-            self.local_candidate_specimens(candidate, variant, LOCAL_VERIFICATION_CANDIDATES)
+            self.local_candidate_specimens(
+                candidate,
+                variant,
+                LOCAL_VERIFICATION_CANDIDATES,
+                &mut cache.local_candidates,
+            )
         });
         if selection.indices.is_empty() {
             return IndexedLocalMatches {
@@ -1534,9 +2410,12 @@ impl Matcher {
                 variant,
                 cache,
             );
-            if let Some(comparison) =
-                verified_local_comparison(&hits, limits, &mut cache.geometry_scratch)
-            {
+            if let Some(comparison) = verified_local_comparison(
+                &hits,
+                limits,
+                &mut cache.correspondences,
+                &mut cache.geometry_scratch,
+            ) {
                 matches.push((specimen_index, comparison));
             } else if threshold.local_unverified_support
                 && let Some(comparison) =
@@ -1559,14 +2438,26 @@ impl Matcher {
         variant: MatchVariant,
         cache: &mut MatchEvaluationCache,
     ) -> CandidateSelection {
-        let slot = match variant {
-            MatchVariant::Original => &mut cache.original_local_selection,
-            MatchVariant::DiscordPreview => &mut cache.preview_local_selection,
+        let cached = match variant {
+            MatchVariant::Original => &cache.original_local_selection,
+            MatchVariant::DiscordPreview => &cache.preview_local_selection,
         };
-        slot.get_or_insert_with(|| {
-            self.local_candidate_specimens(candidate, variant, LOCAL_VERIFICATION_CANDIDATES)
-        })
-        .clone()
+        if let Some(selection) = cached {
+            return selection.clone();
+        }
+        let selection = self.local_candidate_specimens(
+            candidate,
+            variant,
+            LOCAL_VERIFICATION_CANDIDATES,
+            &mut cache.local_candidates,
+        );
+        match variant {
+            MatchVariant::Original => cache.original_local_selection = Some(selection.clone()),
+            MatchVariant::DiscordPreview => {
+                cache.preview_local_selection = Some(selection.clone());
+            }
+        }
+        selection
     }
 
     fn cached_verified_anchor_hits(
@@ -1631,6 +2522,7 @@ impl Matcher {
             limits,
             variant,
             DENSE_LOCAL_VERIFICATION_CANDIDATES,
+            &mut cache.local_candidates,
         );
         if selection.indices.is_empty() {
             return IndexedLocalMatches {
@@ -1652,8 +2544,13 @@ impl Matcher {
                     &candidate_hashes,
                     limits,
                 );
-                verified_local_comparison(&hits, limits, &mut cache.geometry_scratch)
-                    .map(|comparison| (specimen_index, comparison))
+                verified_local_comparison(
+                    &hits,
+                    limits,
+                    &mut cache.correspondences,
+                    &mut cache.geometry_scratch,
+                )
+                .map(|comparison| (specimen_index, comparison))
             })
             .collect();
         IndexedLocalMatches {
@@ -1669,15 +2566,13 @@ impl Matcher {
         candidate: &ParsedCandidate,
         variant: MatchVariant,
         limit: usize,
+        scratch: &mut LocalCandidateScratch,
     ) -> CandidateSelection {
-        let mut best_anchor_matches: HashMap<u64, BestReferenceHit> = HashMap::default();
-        let mut seen_candidate_anchor_pairs: HashSet<(u32, usize, usize)> = HashSet::default();
-        let mut specimen_votes: HashMap<usize, u32> = HashMap::default();
-        let mut seen_candidate_specimen_votes: HashSet<(u32, usize)> = HashSet::default();
         let mut stats = CandidateIndexStats::default();
         let anchor_index = self.variant_anchor_index(variant);
+        let references = self.variant_anchor_references(variant);
         let specimens = self.variant_specimens(variant);
-        let mut query_buckets = Vec::new();
+        scratch.begin(references.len(), specimens.len());
         for (candidate_index, candidate_hash) in candidate.local_hashes.iter().enumerate() {
             if candidate_hash.rotation_degrees != 0 {
                 continue;
@@ -1685,63 +2580,60 @@ impl Matcher {
             for slot in matcher_opt::hamming_segments_flat(candidate_hash.hash) {
                 let bucket_len = anchor_index.get(slot).len();
                 if bucket_len > 0 {
-                    query_buckets.push((bucket_len, candidate_index, slot));
+                    scratch
+                        .query_buckets
+                        .push((bucket_len, candidate_index, slot));
                 }
             }
         }
-        query_buckets.sort_unstable_by(|left, right| {
+        scratch.query_buckets.sort_unstable_by(|left, right| {
             left.0
                 .cmp(&right.0)
                 .then_with(|| left.1.cmp(&right.1))
                 .then_with(|| left.2.cmp(&right.2))
         });
 
-        for (bucket_len, candidate_index, slot) in query_buckets {
+        for bucket_position in 0..scratch.query_buckets.len() {
+            let (bucket_len, candidate_index, slot) = scratch.query_buckets[bucket_position];
             let candidate_hash = &candidate.local_hashes[candidate_index];
             let bucket = anchor_index.get(slot);
             debug_assert_eq!(bucket.len(), bucket_len);
             if bucket_len > ANCHOR_MAX_BUCKET_SIZE {
                 stats.sampled_buckets += 1;
             }
-            for anchor_ref in capped_bucket(bucket, ANCHOR_MAX_BUCKET_SIZE) {
-                record_candidate_vote(
-                    &mut specimen_votes,
-                    &mut seen_candidate_specimen_votes,
-                    candidate_hash.id,
-                    anchor_ref.specimen_index,
-                );
-                if seen_candidate_anchor_pairs.len() >= ANCHOR_MAX_CANDIDATE_PAIR_BUDGET {
+            for &reference_id in capped_bucket(bucket, ANCHOR_MAX_BUCKET_SIZE) {
+                let Some(anchor_ref) = references.get(reference_id as usize) else {
+                    continue;
+                };
+                let specimen_index = anchor_ref.specimen_index as usize;
+                let anchor_index = anchor_ref.anchor_index as usize;
+                scratch.record_vote(candidate_hash.id, anchor_ref.specimen_index);
+                if scratch.seen_pairs.len() >= ANCHOR_MAX_CANDIDATE_PAIR_BUDGET {
                     stats.pair_budget_exhausted = true;
                     return CandidateSelection {
-                        indices: ranked_specimen_candidates(
-                            best_anchor_matches,
-                            specimen_votes,
+                        indices: scratch.rank(
+                            |id| {
+                                references
+                                    .get(id as usize)
+                                    .map(|entry| entry.specimen_index)
+                            },
                             limit,
                         ),
                         stats,
                     };
                 }
-                let pair_key = (
-                    candidate_hash.id,
-                    anchor_ref.specimen_index,
-                    anchor_ref.anchor_index,
-                );
-                if !seen_candidate_anchor_pairs.insert(pair_key) {
+                let pair_key = pack_u32_pair(candidate_hash.id, reference_id);
+                if !scratch.seen_pairs.insert(pair_key) {
                     continue;
                 }
                 let Some(anchor) = specimens
-                    .get(anchor_ref.specimen_index)
-                    .and_then(|specimen| specimen.anchors.get(anchor_ref.anchor_index))
+                    .get(specimen_index)
+                    .and_then(|specimen| specimen.anchors.get(anchor_index))
                 else {
                     continue;
                 };
                 let distance = descriptor_hamming(anchor, candidate_hash);
-                let best_match = best_anchor_matches
-                    .entry(reference_key(
-                        anchor_ref.specimen_index,
-                        anchor_ref.anchor_index,
-                    ))
-                    .or_insert_with(BestReferenceHit::empty);
+                let best_match = scratch.reference_hit(reference_id);
                 if distance > anchor.max_distance {
                     continue;
                 }
@@ -1758,7 +2650,14 @@ impl Matcher {
         }
 
         CandidateSelection {
-            indices: ranked_specimen_candidates(best_anchor_matches, specimen_votes, limit),
+            indices: scratch.rank(
+                |id| {
+                    references
+                        .get(id as usize)
+                        .map(|entry| entry.specimen_index)
+                },
+                limit,
+            ),
             stats,
         }
     }
@@ -1769,15 +2668,13 @@ impl Matcher {
         limits: LocalThresholds,
         variant: MatchVariant,
         limit: usize,
+        scratch: &mut LocalCandidateScratch,
     ) -> CandidateSelection {
-        let mut best_dense_matches: HashMap<u64, BestReferenceHit> = HashMap::default();
-        let mut seen_candidate_dense_pairs: HashSet<(u32, usize, usize)> = HashSet::default();
-        let mut specimen_votes: HashMap<usize, u32> = HashMap::default();
-        let mut seen_candidate_specimen_votes: HashSet<(u32, usize)> = HashSet::default();
         let mut stats = CandidateIndexStats::default();
         let dense_local_index = self.variant_dense_local_index(variant);
+        let references = self.variant_dense_local_references(variant);
         let specimens = self.variant_specimens(variant);
-        let mut query_buckets = Vec::new();
+        scratch.begin(references.len(), specimens.len());
         for (candidate_index, candidate_hash) in candidate_hashes.iter().enumerate() {
             if candidate_hash.rotation_degrees != 0 {
                 continue;
@@ -1785,68 +2682,60 @@ impl Matcher {
             for slot in matcher_opt::dense_local_segments_flat(candidate_hash.hash) {
                 let bucket_len = dense_local_index.get(slot).len();
                 if bucket_len > 0 {
-                    query_buckets.push((bucket_len, candidate_index, slot));
+                    scratch
+                        .query_buckets
+                        .push((bucket_len, candidate_index, slot));
                 }
             }
         }
-        query_buckets.sort_unstable_by(|left, right| {
+        scratch.query_buckets.sort_unstable_by(|left, right| {
             left.0
                 .cmp(&right.0)
                 .then_with(|| left.1.cmp(&right.1))
                 .then_with(|| left.2.cmp(&right.2))
         });
 
-        for (bucket_len, candidate_index, slot) in query_buckets {
+        for bucket_position in 0..scratch.query_buckets.len() {
+            let (bucket_len, candidate_index, slot) = scratch.query_buckets[bucket_position];
             let candidate_hash = candidate_hashes[candidate_index];
             let bucket = dense_local_index.get(slot);
             debug_assert_eq!(bucket.len(), bucket_len);
             if bucket_len > DENSE_LOCAL_MAX_BUCKET_SIZE {
                 stats.sampled_buckets += 1;
             }
-            for dense_ref in capped_bucket(bucket, DENSE_LOCAL_MAX_BUCKET_SIZE) {
-                record_candidate_vote(
-                    &mut specimen_votes,
-                    &mut seen_candidate_specimen_votes,
-                    candidate_hash.id,
-                    dense_ref.specimen_index,
-                );
-                if seen_candidate_dense_pairs.len() >= DENSE_LOCAL_MAX_CANDIDATE_PAIR_BUDGET {
+            for &reference_id in capped_bucket(bucket, DENSE_LOCAL_MAX_BUCKET_SIZE) {
+                let Some(dense_ref) = references.get(reference_id as usize) else {
+                    continue;
+                };
+                let specimen_index = dense_ref.specimen_index as usize;
+                let dense_local_index = dense_ref.dense_local_index as usize;
+                scratch.record_vote(candidate_hash.id, dense_ref.specimen_index);
+                if scratch.seen_pairs.len() >= DENSE_LOCAL_MAX_CANDIDATE_PAIR_BUDGET {
                     stats.pair_budget_exhausted = true;
                     return CandidateSelection {
-                        indices: ranked_specimen_candidates(
-                            best_dense_matches,
-                            specimen_votes,
+                        indices: scratch.rank(
+                            |id| {
+                                references
+                                    .get(id as usize)
+                                    .map(|entry| entry.specimen_index)
+                            },
                             limit,
                         ),
                         stats,
                     };
                 }
-                let pair_key = (
-                    candidate_hash.id,
-                    dense_ref.specimen_index,
-                    dense_ref.dense_local_index,
-                );
-                if !seen_candidate_dense_pairs.insert(pair_key) {
+                let pair_key = pack_u32_pair(candidate_hash.id, reference_id);
+                if !scratch.seen_pairs.insert(pair_key) {
                     continue;
                 }
-                let Some(dense_anchor) =
-                    specimens
-                        .get(dense_ref.specimen_index)
-                        .and_then(|specimen| {
-                            specimen
-                                .dense_local_anchors
-                                .get(dense_ref.dense_local_index)
-                        })
+                let Some(dense_anchor) = specimens
+                    .get(specimen_index)
+                    .and_then(|specimen| specimen.dense_local_anchors.get(dense_local_index))
                 else {
                     continue;
                 };
                 let distance = hamming(dense_anchor.hash, candidate_hash.hash);
-                let best_match = best_dense_matches
-                    .entry(reference_key(
-                        dense_ref.specimen_index,
-                        dense_ref.dense_local_index,
-                    ))
-                    .or_insert_with(BestReferenceHit::empty);
+                let best_match = scratch.reference_hit(reference_id);
                 if distance > limits.max_distance {
                     best_match.observe_distance(distance, candidate_hash.physical_id);
                     continue;
@@ -1862,14 +2751,21 @@ impl Matcher {
         }
 
         CandidateSelection {
-            indices: ranked_specimen_candidates(best_dense_matches, specimen_votes, limit),
+            indices: scratch.rank(
+                |id| {
+                    references
+                        .get(id as usize)
+                        .map(|entry| entry.specimen_index)
+                },
+                limit,
+            ),
             stats,
         }
     }
 
     fn exact_specimen_by_xxh128(
         &self,
-        byte_xxh128: Option<u128>,
+        byte_xxh128: Option<Xxh128>,
         variant: MatchVariant,
     ) -> Option<&IndexedSpecimen> {
         let byte_xxh128 = byte_xxh128?;
@@ -1892,14 +2788,25 @@ impl Matcher {
         }
     }
 
-    fn variant_phash_index(&self, variant: MatchVariant) -> &matcher_opt::FlatSegmentIndex<usize> {
+    fn perceptual_hashes_for(&self, specimen: &IndexedSpecimen) -> Option<&PerceptualHashes> {
+        self.perceptual_hashes
+            .get(specimen.perceptual_hash_id as usize)
+    }
+
+    fn variant_phash_index(
+        &self,
+        variant: MatchVariant,
+    ) -> &matcher_opt::FlatSegmentIndex<SpecimenId> {
         match variant {
             MatchVariant::Original => &self.phash_segment_index,
             MatchVariant::DiscordPreview => &self.preview_phash_segment_index,
         }
     }
 
-    fn variant_dhash_index(&self, variant: MatchVariant) -> &matcher_opt::FlatSegmentIndex<usize> {
+    fn variant_dhash_index(
+        &self,
+        variant: MatchVariant,
+    ) -> &matcher_opt::FlatSegmentIndex<SpecimenId> {
         match variant {
             MatchVariant::Original => &self.dhash_segment_index,
             MatchVariant::DiscordPreview => &self.preview_dhash_segment_index,
@@ -1909,7 +2816,7 @@ impl Matcher {
     fn variant_anchor_index(
         &self,
         variant: MatchVariant,
-    ) -> &matcher_opt::FlatSegmentIndex<IndexedAnchorRef> {
+    ) -> &matcher_opt::FlatSegmentIndex<ReferenceId> {
         match variant {
             MatchVariant::Original => &self.anchor_segment_index,
             MatchVariant::DiscordPreview => &self.preview_anchor_segment_index,
@@ -1919,10 +2826,24 @@ impl Matcher {
     fn variant_dense_local_index(
         &self,
         variant: MatchVariant,
-    ) -> &matcher_opt::FlatSegmentIndex<IndexedDenseLocalRef> {
+    ) -> &matcher_opt::FlatSegmentIndex<ReferenceId> {
         match variant {
             MatchVariant::Original => &self.dense_local_segment_index,
             MatchVariant::DiscordPreview => &self.preview_dense_local_segment_index,
+        }
+    }
+
+    fn variant_anchor_references(&self, variant: MatchVariant) -> &[IndexedAnchorRef] {
+        match variant {
+            MatchVariant::Original => &self.anchor_references,
+            MatchVariant::DiscordPreview => &self.preview_anchor_references,
+        }
+    }
+
+    fn variant_dense_local_references(&self, variant: MatchVariant) -> &[IndexedDenseLocalRef] {
+        match variant {
+            MatchVariant::Original => &self.dense_local_references,
+            MatchVariant::DiscordPreview => &self.preview_dense_local_references,
         }
     }
 }
@@ -1935,12 +2856,11 @@ struct VisualShapeEvidence {
 
 impl IndexedSpecimen {
     fn new(record: SpecimenRecord) -> Self {
+        let record = Arc::new(record);
         let parts = IndexedSpecimenParts::new(IndexedSpecimenPartsInput {
             width: record.image.width,
             height: record.image.height,
             byte_xxh128: &record.image.byte_xxh128,
-            phash64: &record.image.phash64,
-            dhash64: &record.image.dhash64,
             visual: &record.image.visual,
             anchors: &record.anchors,
             local_hashes: &record.local_hashes,
@@ -1948,27 +2868,24 @@ impl IndexedSpecimen {
         Self::from_parts(record, parts)
     }
 
-    fn new_preview(record: &SpecimenRecord) -> Option<Self> {
+    fn new_preview(record: &Arc<SpecimenRecord>) -> Option<Self> {
         let preview = record.preview.as_ref()?;
         let parts = IndexedSpecimenParts::new(IndexedSpecimenPartsInput {
             width: preview.width,
             height: preview.height,
             byte_xxh128: &preview.byte_xxh128,
-            phash64: &preview.phash64,
-            dhash64: &preview.dhash64,
             visual: &preview.visual,
             anchors: &preview.anchors,
             local_hashes: &preview.local_hashes,
         });
-        Some(Self::from_parts(record.clone(), parts))
+        Some(Self::from_parts(Arc::clone(record), parts))
     }
 
-    fn from_parts(record: SpecimenRecord, parts: IndexedSpecimenParts) -> Self {
+    fn from_parts(record: Arc<SpecimenRecord>, parts: IndexedSpecimenParts) -> Self {
         Self {
             record,
             byte_xxh128: parts.byte_xxh128,
-            phash64: parts.phash64,
-            dhash64: parts.dhash64,
+            perceptual_hash_id: INVALID_PERCEPTUAL_HASH_ID,
             visual: parts.visual,
             geometry: parts.geometry,
             anchors: parts.anchors,
@@ -1980,22 +2897,22 @@ impl IndexedSpecimen {
 impl IndexedSpecimenParts {
     fn new(input: IndexedSpecimenPartsInput<'_>) -> Self {
         Self {
-            byte_xxh128: hex32_to_u128(input.byte_xxh128),
-            phash64: hex16_to_u64(input.phash64),
-            dhash64: hex16_to_u64(input.dhash64),
-            visual: input.visual.clone(),
+            byte_xxh128: Xxh128::from_hex(input.byte_xxh128),
+            visual: Arc::new(input.visual.clone()),
             geometry: FingerprintGeometry::from_dimensions(input.width, input.height),
             anchors: input
                 .anchors
                 .iter()
                 .filter_map(ParsedAnchor::from_anchor)
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             dense_local_anchors: input
                 .local_hashes
                 .iter()
                 .enumerate()
                 .map(|(index, hash)| ParsedLocalHash::from_local_hash(index, hash))
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 }
@@ -2003,21 +2920,18 @@ impl IndexedSpecimenParts {
 impl ExactHashSpecimen {
     fn new(record: &SpecimenRecord) -> Self {
         let visual = record.image.visual.clone();
-        let text_grid_stats = text_grid_stats(&visual.text_grid);
-        let geometry =
-            FingerprintGeometry::from_dimensions(record.image.width, record.image.height);
         Self {
             specimen_id: record.specimen_id.clone(),
+            text_grid_stats: text_grid_stats(&visual.text_grid),
+            geometry: FingerprintGeometry::from_dimensions(record.image.width, record.image.height),
             visual,
-            text_grid_stats,
-            geometry,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct ParsedCandidate {
-    byte_xxh128: Option<u128>,
+    byte_xxh128: Option<Xxh128>,
     phash64: Option<u64>,
     dhash64: Option<u64>,
     visual: ImageVisualSignature,
@@ -2089,7 +3003,7 @@ impl GeometryLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 struct ParsedLocalHash {
     id: u32,
     physical_id: u32,
@@ -2206,64 +3120,6 @@ impl BestReferenceHit {
     }
 }
 
-fn ranked_specimen_candidates(
-    best_anchor_matches: HashMap<u64, BestReferenceHit>,
-    specimen_votes: HashMap<usize, u32>,
-    limit: usize,
-) -> Vec<usize> {
-    let mut per_specimen: HashMap<usize, (usize, u32, u64)> = HashMap::default();
-    for (specimen_index, votes) in specimen_votes {
-        per_specimen.entry(specimen_index).or_default().1 = votes;
-    }
-    for (key, best_match) in best_anchor_matches {
-        if let Some(hit) = best_match.best {
-            let specimen_index = reference_key_specimen(key);
-            let entry = per_specimen.entry(specimen_index).or_default();
-            entry.0 += 1;
-            entry.2 = entry.2.saturating_add(u64::from(hit.quality));
-        }
-    }
-
-    let mut ranked = per_specimen
-        .into_iter()
-        .map(|(specimen_index, (hits, votes, quality_sum))| {
-            (specimen_index, hits, votes, quality_sum)
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_unstable_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.2.cmp(&left.2))
-            .then_with(|| left.3.cmp(&right.3))
-    });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(specimen_index, _hits, _votes, _quality_sum)| specimen_index)
-        .collect()
-}
-
-fn record_candidate_vote(
-    specimen_votes: &mut HashMap<usize, u32>,
-    seen_votes: &mut HashSet<(u32, usize)>,
-    candidate_id: u32,
-    specimen_index: usize,
-) {
-    if seen_votes.insert((candidate_id, specimen_index)) {
-        let entry = specimen_votes.entry(specimen_index).or_default();
-        *entry = entry.saturating_add(1);
-    }
-}
-
-fn reference_key(specimen_index: usize, reference_index: usize) -> u64 {
-    ((specimen_index as u64) << 32) | reference_index as u64
-}
-
-fn reference_key_specimen(key: u64) -> usize {
-    (key >> 32) as usize
-}
-
 fn capped_bucket<T>(bucket: &[T], cap: usize) -> impl Iterator<Item = &T> {
     let cap = cap.max(1);
     let stride = if bucket.len() <= cap {
@@ -2293,7 +3149,7 @@ const fn local_candidate_miss_reason(
 impl ParsedCandidate {
     fn from_image(image: &ImageFingerprint) -> Self {
         Self {
-            byte_xxh128: hex32_to_u128(&image.byte_xxh128),
+            byte_xxh128: Xxh128::from_hex(&image.byte_xxh128),
             phash64: hex16_to_u64(&image.phash64),
             dhash64: hex16_to_u64(&image.dhash64),
             visual: image.visual.clone(),
@@ -2523,16 +3379,16 @@ fn rgb_channel_spread(rgb_mean: [u8; 3]) -> u8 {
 }
 
 fn hash_distances(
-    specimen: &IndexedSpecimen,
+    specimen: Option<&PerceptualHashes>,
     candidate: &ParsedCandidate,
 ) -> (Option<u32>, Option<u32>) {
     (
         specimen
-            .phash64
+            .and_then(|hashes| hashes.phash64)
             .zip(candidate.phash64)
             .map(|(left, right)| hamming(left, right)),
         specimen
-            .dhash64
+            .and_then(|hashes| hashes.dhash64)
             .zip(candidate.dhash64)
             .map(|(left, right)| hamming(left, right)),
     )
@@ -2558,6 +3414,22 @@ fn exact_outcome(
     }
 }
 
+fn exact_outcome_compact(
+    specimen: &IndexedSpecimen,
+    candidate: &ParsedCandidate,
+    input: ThresholdInput<'_>,
+) -> MatchOutcome {
+    let mut diagnostics = match_diagnostics_for_candidate(candidate, input.variant);
+    diagnostics.steps.push(exact_xxh128_step(
+        input.name,
+        true,
+        Some(specimen.record.specimen_id.clone()),
+        Some(1),
+        None,
+    ));
+    exact_outcome(specimen, input.suspicious, diagnostics)
+}
+
 fn exact_hash_outcome(
     specimen: &ExactHashSpecimen,
     suspicious: bool,
@@ -2578,20 +3450,16 @@ fn exact_hash_outcome(
     }
 }
 
-fn match_diagnostics_for_exact_hash_specimen(
-    specimen: &ExactHashSpecimen,
-    representation: FingerprintRepresentation,
-) -> MatchDiagnostics {
-    let text_stats = specimen.text_grid_stats;
+fn match_diagnostics_for_exact_hash_specimen(specimen: &ExactHashSpecimen) -> MatchDiagnostics {
     MatchDiagnostics {
-        representation,
+        representation: FingerprintRepresentation::Original,
         candidate_short_edge: specimen.geometry.short_edge,
         candidate_area: specimen.geometry.area,
         candidate_aspect: specimen.geometry.aspect,
         candidate_luma_mean: specimen.visual.luma_mean,
         candidate_luma_std: specimen.visual.luma_std,
-        candidate_text_grid_mean: text_stats.mean,
-        candidate_text_regions: text_stats.regions,
+        candidate_text_grid_mean: specimen.text_grid_stats.mean,
+        candidate_text_regions: specimen.text_grid_stats.regions,
         candidate_local_hashes: 0,
         steps: Vec::new(),
     }
@@ -2787,6 +3655,7 @@ struct ScoredOutcome {
 
 fn build_coherence_graph(
     specimens: &[IndexedSpecimen],
+    perceptual_hashes: &[PerceptualHashes],
     threshold: &DetectionThreshold,
 ) -> CoherenceGraph {
     if specimens.len() > CLUSTER_GRAPH_MAX_SPECIMENS {
@@ -2800,8 +3669,12 @@ fn build_coherence_graph(
                 return builder.build();
             }
             evaluations += 1;
-            let score =
-                specimen_pair_coherence_score(&specimens[left], &specimens[right], threshold);
+            let score = specimen_pair_coherence_score(
+                &specimens[left],
+                &specimens[right],
+                perceptual_hashes,
+                threshold,
+            );
             if score > 0 {
                 builder.add_edge(left as SpecimenId, right as SpecimenId, score);
             }
@@ -2810,42 +3683,19 @@ fn build_coherence_graph(
     builder.build()
 }
 
-fn append_coherence_graph(
-    existing: &CoherenceGraph,
-    specimens: &[IndexedSpecimen],
-    new_index: usize,
-    threshold: &DetectionThreshold,
-) -> CoherenceGraph {
-    if specimens.len() > CLUSTER_GRAPH_MAX_SPECIMENS {
-        return CoherenceGraph::default();
-    }
-    let mut builder = CoherenceGraphBuilder::new(specimens.len(), CLUSTER_GRAPH_BUILD_FLOOR);
-    for (left, right, coherence) in existing.undirected_edges() {
-        builder.add_edge(left, right, coherence);
-    }
-    let Some(new_specimen) = specimens.get(new_index) else {
-        return builder.build();
-    };
-    for (evaluations, (index, specimen)) in specimens.iter().enumerate().take(new_index).enumerate()
-    {
-        if evaluations >= CLUSTER_GRAPH_MAX_PAIR_EVALUATIONS {
-            break;
-        }
-        let score = specimen_pair_coherence_score(specimen, new_specimen, threshold);
-        if score > 0 {
-            builder.add_edge(index as SpecimenId, new_index as SpecimenId, score);
-        }
-    }
-    builder.build()
-}
-
 fn specimen_pair_coherence_score(
     left: &IndexedSpecimen,
     right: &IndexedSpecimen,
+    perceptual_hashes: &[PerceptualHashes],
     threshold: &DetectionThreshold,
 ) -> u32 {
-    specimen_pair_directional_score(left, right, threshold)
-        .max(specimen_pair_directional_score(right, left, threshold))
+    specimen_pair_directional_score(left, right, perceptual_hashes, threshold)
+        .max(specimen_pair_directional_score(
+            right,
+            left,
+            perceptual_hashes,
+            threshold,
+        ))
         .round()
         .clamp(0.0, 1_000.0) as u32
 }
@@ -2853,6 +3703,7 @@ fn specimen_pair_coherence_score(
 fn specimen_pair_directional_score(
     reference: &IndexedSpecimen,
     candidate: &IndexedSpecimen,
+    perceptual_hashes: &[PerceptualHashes],
     threshold: &DetectionThreshold,
 ) -> f32 {
     let geometry_compatible =
@@ -2863,11 +3714,17 @@ fn specimen_pair_directional_score(
 
     let visual_score = visual_signature_score(&reference.visual, &candidate.visual, threshold);
     let mut score = 0.0;
+    let reference_hashes = perceptual_hashes.get(reference.perceptual_hash_id as usize);
+    let candidate_hashes = perceptual_hashes.get(candidate.perceptual_hash_id as usize);
     if threshold.perceptual_hash
-        && let Some(distances) = reference
-            .phash64
-            .zip(candidate.phash64)
-            .zip(reference.dhash64.zip(candidate.dhash64))
+        && let Some(distances) = reference_hashes
+            .and_then(|hashes| hashes.phash64)
+            .zip(candidate_hashes.and_then(|hashes| hashes.phash64))
+            .zip(
+                reference_hashes
+                    .and_then(|hashes| hashes.dhash64)
+                    .zip(candidate_hashes.and_then(|hashes| hashes.dhash64)),
+            )
             .map(|((left_phash, right_phash), (left_dhash, right_dhash))| {
                 (
                     hamming(left_phash, right_phash),
@@ -2886,13 +3743,18 @@ fn specimen_pair_directional_score(
     if threshold.local_anchors {
         let limits = LocalThresholds::from_detection_threshold(threshold);
         let mut geometry_scratch = GeometryScratch::default();
+        let mut correspondences = Vec::new();
         let anchor_hits = collect_verified_anchor_hits(
             &reference.anchors,
             &candidate.dense_local_anchors,
             limits,
         );
-        if let Some(local) = verified_local_comparison(&anchor_hits, limits, &mut geometry_scratch)
-        {
+        if let Some(local) = verified_local_comparison(
+            &anchor_hits,
+            limits,
+            &mut correspondences,
+            &mut geometry_scratch,
+        ) {
             score += stage_score_with_visual(
                 local_anchor_score(&local, threshold),
                 visual_score,
@@ -2905,7 +3767,12 @@ fn specimen_pair_directional_score(
             &candidate.dense_local_anchors,
             limits,
         );
-        if let Some(local) = verified_local_comparison(&dense_hits, limits, &mut geometry_scratch) {
+        if let Some(local) = verified_local_comparison(
+            &dense_hits,
+            limits,
+            &mut correspondences,
+            &mut geometry_scratch,
+        ) {
             score += stage_score_with_visual(
                 local_anchor_score(&local, threshold),
                 visual_score,
@@ -3423,15 +4290,14 @@ impl From<LocalThresholds> for LocalFeatureFilter {
 fn verified_local_comparison(
     hits: &[AnchorHit],
     threshold: LocalThresholds,
+    correspondences: &mut Vec<Correspondence>,
     geometry_scratch: &mut GeometryScratch,
 ) -> Option<LocalAnchorComparison> {
     if hits.len() < threshold.min_anchor_hits {
         return None;
     }
-    let correspondences = hits
-        .iter()
-        .map(|hit| hit.correspondence)
-        .collect::<Vec<_>>();
+    correspondences.clear();
+    correspondences.extend(hits.iter().map(|hit| hit.correspondence));
     let geo_cfg = GeoCfg {
         min_inliers: threshold.min_anchor_hits.clamp(2, 3),
         inlier_residual: 24.0,
@@ -3446,7 +4312,7 @@ fn verified_local_comparison(
         prosac_min_inliers: threshold.geometry_prosac_min_inliers,
         ..GeoCfg::default()
     };
-    let geo = verify_geometry_with_scratch(&correspondences, &geo_cfg, geometry_scratch)?;
+    let geo = verify_geometry_with_scratch(correspondences, &geo_cfg, geometry_scratch)?;
     let accept = geometry_acceptance_for_model(&geo, threshold);
     geo_passes(&geo, &accept).then(|| local_comparison_from_geo(&geo))
 }
@@ -3573,6 +4439,7 @@ fn anchor_hit_passes_ratio(hit: &AnchorHit, ratio_min_margin: u8) -> bool {
 
 fn local_unverified_support_passes(
     specimen: &IndexedSpecimen,
+    perceptual_hashes: Option<&PerceptualHashes>,
     candidate: &ParsedCandidate,
     local: &LocalSupportComparison,
     threshold: &DetectionThreshold,
@@ -3596,7 +4463,7 @@ fn local_unverified_support_passes(
     {
         return false;
     }
-    let (phash64_distance, dhash64_distance) = hash_distances(specimen, candidate);
+    let (phash64_distance, dhash64_distance) = hash_distances(perceptual_hashes, candidate);
     let Some((phash64_distance, dhash64_distance)) = phash64_distance.zip(dhash64_distance) else {
         return false;
     };
@@ -3718,8 +4585,13 @@ fn compare_local_anchors_with_threshold(
     }
 
     let hits = collect_verified_anchor_hits(anchors, candidate_hashes, threshold);
-    verified_local_comparison(&hits, threshold, &mut GeometryScratch::default())
-        .unwrap_or_else(LocalAnchorComparison::miss)
+    verified_local_comparison(
+        &hits,
+        threshold,
+        &mut Vec::new(),
+        &mut GeometryScratch::default(),
+    )
+    .unwrap_or_else(LocalAnchorComparison::miss)
 }
 
 fn candidate_dense_local_hashes(candidate_hashes: &[ParsedLocalHash]) -> Vec<&ParsedLocalHash> {
@@ -4078,6 +4950,184 @@ mod tests {
     }
 
     #[test]
+    fn compact_index_references_stay_cache_friendly() {
+        assert_eq!(std::mem::size_of::<IndexedAnchorRef>(), 8);
+        assert_eq!(std::mem::size_of::<IndexedDenseLocalRef>(), 8);
+        assert_eq!(std::mem::size_of::<ReferenceId>(), 4);
+        assert_eq!(std::mem::size_of::<SpecimenId>(), 4);
+        assert_eq!(std::mem::size_of::<PerceptualHashId>(), 4);
+    }
+
+    #[test]
+    fn matcher_interns_duplicate_read_only_fingerprint_data() {
+        let mut first = specimen("0123456789abcdef", "fedcba9876543210");
+        first.specimen_id = "spm_first".to_owned();
+        first.anchors = vec![test_anchor(1), test_anchor(2)];
+        first.local_hashes = vec![test_local_hash(3), test_local_hash(4)];
+        let mut second = first.clone();
+        second.specimen_id = "spm_second".to_owned();
+
+        let matcher = Matcher::new(vec![first, second]);
+        let first = &matcher.specimens[0];
+        let second = &matcher.specimens[1];
+
+        assert_eq!(matcher.perceptual_hashes.len(), 1);
+        assert_eq!(first.perceptual_hash_id, second.perceptual_hash_id);
+        assert!(Arc::ptr_eq(&first.visual, &second.visual));
+        assert!(Arc::ptr_eq(&first.anchors, &second.anchors));
+        assert!(Arc::ptr_eq(
+            &first.dense_local_anchors,
+            &second.dense_local_anchors
+        ));
+    }
+
+    #[test]
+    fn matcher_batch_add_publishes_all_records_with_one_compact_pool() {
+        let mut first = specimen("0123456789abcdef", "fedcba9876543210");
+        first.specimen_id = "spm_batch_first".to_owned();
+        let mut second = first.clone();
+        second.specimen_id = "spm_batch_second".to_owned();
+        let mut matcher = Matcher::default();
+
+        matcher.add_batch_with_policy([first, second], None);
+
+        assert_eq!(matcher.len(), 2);
+        assert_eq!(matcher.perceptual_hashes.len(), 1);
+        assert_eq!(
+            matcher.specimens[0].perceptual_hash_id,
+            matcher.specimens[1].perceptual_hash_id
+        );
+    }
+
+    #[test]
+    fn anchor_buckets_store_compact_global_reference_ids() {
+        let mut record = specimen("0000000000000000", "0000000000000000");
+        record.anchors = vec![test_anchor(1), test_anchor(2)];
+        record.local_hashes = vec![test_local_hash(3), test_local_hash(4)];
+
+        let matcher = Matcher::new(vec![record]);
+
+        assert_eq!(matcher.anchor_references.len(), 2);
+        assert_eq!(matcher.dense_local_references.len(), 2);
+        assert!(matcher.anchor_segment_index.slot_lens().sum::<usize>() > 0);
+        for slot in 0..matcher_opt::HAMMING_FLAT_SLOTS {
+            assert!(
+                matcher
+                    .anchor_segment_index
+                    .get(slot)
+                    .iter()
+                    .all(|id| { matcher.anchor_references.get(*id as usize).is_some() })
+            );
+        }
+        for slot in 0..matcher_opt::DENSE_LOCAL_FLAT_SLOTS {
+            assert!(
+                matcher
+                    .dense_local_segment_index
+                    .get(slot)
+                    .iter()
+                    .all(|id| { matcher.dense_local_references.get(*id as usize).is_some() })
+            );
+        }
+    }
+
+    #[test]
+    fn reusable_matcher_scratch_preserves_results_and_capacity_between_queries() {
+        let mut record = specimen("0000000000000000", "0000000000000000");
+        record.specimen_id = "spm_scratch".to_owned();
+        record.anchors = (0..32).map(test_anchor).collect();
+        let matcher = Matcher::new(vec![record]);
+        let policy = policy(&MatchConfig::default());
+        let first = test_candidate((0..64).map(test_local_hash).collect());
+        let second = test_candidate(
+            (128..192)
+                .map(|index| {
+                    let mut hash = test_local_hash(index);
+                    hash.hash = !hash.hash;
+                    hash.hash2 = !hash.hash2;
+                    hash
+                })
+                .collect(),
+        );
+        let mut scratch = MatcherScratch::default();
+
+        let first_expected = matcher.find_for_policy(&first, &policy);
+        let first_reused = matcher.find_for_policy_with_scratch(&first, &policy, &mut scratch);
+        assert_eq!(
+            serde_json::to_value(first_expected).unwrap(),
+            serde_json::to_value(first_reused).unwrap()
+        );
+        let bucket_capacity = scratch.evaluation.local_candidates.query_buckets.capacity();
+        assert!(bucket_capacity > 0);
+
+        let second_expected = matcher.find_for_policy(&second, &policy);
+        let second_reused = matcher.find_for_policy_with_scratch(&second, &policy, &mut scratch);
+        assert_eq!(
+            serde_json::to_value(second_expected).unwrap(),
+            serde_json::to_value(second_reused).unwrap()
+        );
+        assert!(scratch.evaluation.local_candidates.query_buckets.capacity() >= bucket_capacity);
+    }
+
+    #[test]
+    fn original_and_preview_indexes_share_the_specimen_record() {
+        let mut record = specimen("0000000000000000", "0000000000000000");
+        record.local_hashes.push(test_local_hash(1));
+        record.preview = Some(SpecimenPreview {
+            width: 800,
+            height: 960,
+            mime: Some("image/png".to_owned()),
+            byte_xxh128: "c".repeat(32),
+            phash64: "0000000000000001".to_owned(),
+            dhash64: "0000000000000002".to_owned(),
+            visual: ImageVisualSignature::default(),
+            anchors: Vec::new(),
+            local_hashes: vec![test_local_hash(2)],
+        });
+
+        let matcher = Matcher::new(vec![record]);
+        let original = &matcher.specimens[0].record;
+        let preview = &matcher.preview_specimens[0].record;
+
+        assert!(Arc::ptr_eq(original, preview));
+        assert_eq!(Arc::strong_count(original), 2);
+        assert_eq!(matcher.records()[0].local_hashes.len(), 1);
+    }
+
+    #[test]
+    fn dense_perceptual_dedup_matches_hash_set_order_and_reuses_results() {
+        let mut index = matcher_opt::FlatSegmentIndex::with_slots(matcher_opt::HAMMING_FLAT_SLOTS);
+        let hashes = (0_u64..2_000)
+            .map(|value| value.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .collect::<Vec<_>>();
+        for (specimen_id, hash) in hashes.iter().enumerate() {
+            for slot in matcher_opt::hamming_segments_flat(*hash) {
+                index.push(slot, specimen_id as SpecimenId);
+            }
+        }
+
+        let query = 0x1234_5678_9abc_def0;
+        let mut expected_seen = HashSet::default();
+        let mut expected = Vec::new();
+        for slot in matcher_opt::hamming_segments_flat(query) {
+            for &specimen_id in index.get(slot) {
+                if expected_seen.insert(specimen_id) {
+                    expected.push(specimen_id);
+                }
+            }
+        }
+
+        let key = (MatchVariant::Original, PerceptualHashKind::PHash, query);
+        let mut cache = PerceptualCandidateCache::default();
+        cache.collect(key, &index, hashes.len());
+        assert_eq!(cache.indices, expected);
+
+        let generation = cache.generation;
+        cache.collect(key, &index, hashes.len());
+        assert_eq!(cache.generation, generation);
+        assert_eq!(cache.indices, expected);
+    }
+
+    #[test]
     fn exact_xxh128_matches_first() {
         let mut specimen = specimen("0000000000000000", "0000000000000000");
         specimen.image.byte_xxh128 = "a".repeat(32);
@@ -4255,6 +5305,61 @@ mod tests {
     }
 
     #[test]
+    fn compact_production_path_matches_explainer_decisions() {
+        let policy = policy(&MatchConfig::default());
+
+        let exact_matcher = Matcher::new(vec![specimen("0000000000000000", "0000000000000000")]);
+        let mut exact_candidate = test_candidate(Vec::new());
+        exact_candidate.byte_xxh128 = "b".repeat(32);
+        assert_fast_and_explained_decisions_match(&exact_matcher, &exact_candidate, &policy);
+
+        let perceptual_matcher =
+            Matcher::new(vec![specimen("0000000000000000", "0000000000000000")]);
+        let mut perceptual_candidate = test_candidate(Vec::new());
+        perceptual_candidate.phash64 = "000000000000003f".to_owned();
+        perceptual_candidate.dhash64 = "000000000000003f".to_owned();
+        assert_fast_and_explained_decisions_match(
+            &perceptual_matcher,
+            &perceptual_candidate,
+            &policy,
+        );
+
+        let mut local_record = specimen("0000000000000000", "0000000000000000");
+        local_record.anchors = (0..32).map(test_anchor).collect();
+        let local_matcher = Matcher::new(vec![local_record]);
+        let local_candidate = test_candidate((0..64).map(test_local_hash).collect());
+        assert_fast_and_explained_decisions_match(&local_matcher, &local_candidate, &policy);
+
+        let negative_candidate = test_candidate(
+            (128..192)
+                .map(|index| {
+                    let mut hash = test_local_hash(index);
+                    hash.hash = !hash.hash;
+                    hash.hash2 = !hash.hash2;
+                    hash
+                })
+                .collect(),
+        );
+        assert_fast_and_explained_decisions_match(&local_matcher, &negative_candidate, &policy);
+    }
+
+    #[test]
+    fn compact_negative_keeps_no_materialized_stage_evidence() {
+        let matcher = Matcher::new(vec![specimen("0000000000000000", "0000000000000000")]);
+        let candidate = test_candidate(Vec::new());
+        let policy = policy(&MatchConfig::default());
+        let mut scratch = MatcherScratch::default();
+
+        assert!(
+            matcher
+                .find_for_policy_with_scratch(&candidate, &policy, &mut scratch)
+                .is_none()
+        );
+        assert!(scratch.evaluation.compact.evidence.is_empty());
+        assert!(scratch.evaluation.compact.touched_specimens.is_empty());
+    }
+
+    #[test]
     fn preview_variants_match_only_through_preview_matcher() {
         let mut record = specimen("ffffffffffffffff", "ffffffffffffffff");
         record.preview = Some(SpecimenPreview {
@@ -4287,7 +5392,11 @@ mod tests {
 
         assert!(matcher.find_for_policy(&candidate, &policy).is_none());
         let outcome = matcher
-            .find_preview_for_policy(&candidate, &policy)
+            .find_preview_for_policy_with_scratch(
+                &candidate,
+                &policy,
+                &mut MatcherScratch::default(),
+            )
             .unwrap();
 
         assert!(matches!(outcome.confidence, MatchConfidence::Perceptual));
@@ -4308,7 +5417,11 @@ mod tests {
             local_hashes: Vec::new(),
         };
         let outcome = matcher
-            .find_preview_for_policy(&preview_exact_only, &policy)
+            .find_preview_for_policy_with_scratch(
+                &preview_exact_only,
+                &policy,
+                &mut MatcherScratch::default(),
+            )
             .unwrap();
 
         assert!(matches!(outcome.confidence, MatchConfidence::ExactXxh128));
@@ -4667,6 +5780,72 @@ mod tests {
             edge_density: 80,
             scale_percent: 100,
             rotation_degrees: 0,
+        }
+    }
+
+    fn test_candidate(local_hashes: Vec<LocalImageHash>) -> ImageFingerprint {
+        ImageFingerprint {
+            width: 1000,
+            height: 1200,
+            mime: Some("image/png".to_owned()),
+            byte_xxh128: "d".repeat(32),
+            phash64: "ffffffffffffffff".to_owned(),
+            dhash64: "ffffffffffffffff".to_owned(),
+            visual: ImageVisualSignature::default(),
+            local_anchors: Vec::new(),
+            local_hashes,
+        }
+    }
+
+    fn assert_fast_and_explained_decisions_match(
+        matcher: &Matcher,
+        candidate: &ImageFingerprint,
+        policy: &DetectionPolicy,
+    ) {
+        let fast = matcher.find_for_policy(candidate, policy);
+        let explained = matcher
+            .explain_for_policy_with_mode(candidate, policy, MatchEvaluationMode::ShortCircuit)
+            .outcome;
+        assert_eq!(
+            decision_json(fast.as_ref()),
+            decision_json(explained.as_ref())
+        );
+    }
+
+    fn decision_json(outcome: Option<&MatchOutcome>) -> serde_json::Value {
+        outcome.map_or(serde_json::Value::Null, |outcome| {
+            serde_json::json!({
+                "specimen_id": outcome.specimen_id,
+                "confidence": outcome.confidence,
+                "suspicious": outcome.suspicious,
+                "match_score": outcome.match_score,
+                "phash64_distance": outcome.phash64_distance,
+                "dhash64_distance": outcome.dhash64_distance,
+                "local_anchor_hits": outcome.local_anchor_hits,
+                "local_distinct_regions": outcome.local_distinct_regions,
+                "local_average_distance": outcome.local_average_distance,
+                "local_geometry_model": outcome.local_geometry_model,
+            })
+        })
+    }
+
+    fn test_anchor(index: u32) -> ImageAnchor {
+        ImageAnchor {
+            id: format!("a{index:02}"),
+            x: index * 8,
+            y: index * 4,
+            w: 64,
+            h: 32,
+            pos_x: 32,
+            pos_y: 32,
+            hash: format!("{index:016x}"),
+            hash2: format!("{:016x}", index.rotate_left(17)),
+            luma_mean: 60,
+            luma_std: 60,
+            edge_density: 80,
+            kind: "orb_fast_brief".to_owned(),
+            region: index % 16,
+            max_distance: 8,
         }
     }
 }

@@ -1576,11 +1576,6 @@ async fn persist_config(
         return Err(source.context("persisting guild config"));
     }
 
-    state.guild_config.store(Arc::new(config.clone()));
-    state.detection_policy_hash.store(
-        config.detection_cache_policy_hash(),
-        std::sync::atomic::Ordering::Release,
-    );
     if let Err(source) = state
         .refresh_matcher_policy(config.detection_policy.clone())
         .await
@@ -1591,11 +1586,24 @@ async fn persist_config(
             ?source,
             "failed to refresh matcher coherence policy after config update"
         );
+        state.safe_mode.store(true, Ordering::Release);
+        state.permissions_ok.store(false, Ordering::Release);
+        return Err(source.context(
+            "config was persisted, but matcher policy refresh failed; guild entered safe mode",
+        ));
     }
+    state.guild_config.store(Arc::new(config.clone()));
+    state.detection_policy_hash.store(
+        config.detection_cache_policy_hash(),
+        std::sync::atomic::Ordering::Release,
+    );
     state
         .scan_exempt_roles
         .store(Arc::new(config.parsed_scan_exempt_role_ids()));
-    state.hash_outcome_cache.lock().clear();
+    state
+        .hash_outcome_cache
+        .lock()
+        .clear_guild(state.guild_id().get());
     state.clear_hash_processing();
     state.ocr_singleflight.clear();
     state.guild_configured.store(true, Ordering::Release);

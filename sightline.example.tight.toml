@@ -16,7 +16,16 @@ download_concurrency = 64
 # OCR HTTP budget. OCR follow-ups are off the image worker hot path.
 ocr_concurrency = 4
 max_images_per_message = 10
+# Process-wide, guild-scoped result cache. Capacity is shared by every guild.
 hash_outcome_cache_size = 100000
+# Process-wide reservation budget for downloaded bodies waiting on CPU work.
+# Known content-length responses reserve their actual size; chunked responses
+# reserve download.max_bytes. This prevents download bursts from exhausting RAM.
+download_memory_max_bytes = 134217728
+# Process-wide budget for decoded images. Each image reserves from its probed
+# dimensions using a conservative whole-pipeline working-set estimate; staged
+# images retain that reservation until local feature extraction finishes.
+decoded_image_memory_max_bytes = 268435456
 # Process-wide cap for original image bytes retained by OCR/specimen follow-ups.
 byte_store_max_bytes = 67108864
 

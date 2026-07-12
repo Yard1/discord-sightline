@@ -18,7 +18,7 @@ use crate::{
         storage_codec::{CONFIG_PREFIX, SPECIMEN_PREFIX},
     },
     image::{
-        pipeline::{HashMode, hash_image_bytes, is_discord_host},
+        pipeline::{CpuGate, HashMode, hash_image_bytes_gated, is_discord_host},
         types::{ImageCandidate, MatchOutcome},
     },
 };
@@ -909,6 +909,8 @@ pub async fn edit_interaction_response_data(
 pub struct LedgerRecoveryConfig<'a> {
     pub base_match_config: &'a MatchConfig,
     pub max_decoded_pixels: u64,
+    pub decode_gate: &'a Arc<CpuGate>,
+    pub decoded_memory_gate: &'a Arc<tokio::sync::Semaphore>,
 }
 
 pub async fn load_ledger(
@@ -1115,6 +1117,8 @@ struct SpecimenRecoveryContext<'a> {
     bot_user_id: Id<UserMarker>,
     match_config: MatchConfig,
     max_decoded_pixels: u64,
+    decode_gate: &'a Arc<CpuGate>,
+    decoded_memory_gate: &'a Arc<tokio::sync::Semaphore>,
 }
 
 async fn read_storage_messages(
@@ -1420,6 +1424,8 @@ async fn recover_stale_specimen_records(
         bot_user_id,
         match_config,
         max_decoded_pixels: recovery.max_decoded_pixels,
+        decode_gate: recovery.decode_gate,
+        decoded_memory_gate: recovery.decoded_memory_gate,
     };
     let recoverable = std::mem::take(&mut loaded.recoverable_specimens);
     for stale in recoverable {
@@ -1475,6 +1481,8 @@ async fn recover_stale_specimen_record(
         original_attachment.content_type.clone(),
         context.max_decoded_pixels,
         &context.match_config,
+        context.decode_gate,
+        context.decoded_memory_gate,
     )
     .await
     .context("hashing original recovery image")?;
@@ -1494,6 +1502,8 @@ async fn recover_stale_specimen_record(
                     attachment.content_type.clone(),
                     context.max_decoded_pixels,
                     &context.match_config,
+                    context.decode_gate,
+                    context.decoded_memory_gate,
                 )
                 .await
                 .context("hashing Discord preview recovery image")?,
@@ -1541,19 +1551,19 @@ async fn hash_recovered_specimen_image(
     mime: Option<String>,
     max_decoded_pixels: u64,
     match_config: &MatchConfig,
+    decode_gate: &Arc<CpuGate>,
+    decoded_memory_gate: &Arc<tokio::sync::Semaphore>,
 ) -> Result<crate::image::types::ImageFingerprint> {
-    let match_config = match_config.clone();
-    tokio::task::spawn_blocking(move || {
-        hash_image_bytes(
-            bytes.as_ref(),
-            mime,
-            max_decoded_pixels,
-            &match_config,
-            HashMode::Specimen,
-        )
-    })
+    hash_image_bytes_gated(
+        bytes,
+        mime,
+        max_decoded_pixels,
+        match_config,
+        decode_gate,
+        decoded_memory_gate,
+        HashMode::Specimen,
+    )
     .await
-    .context("specimen recovery hash task panicked")?
 }
 
 async fn repair_specimen_record_message(

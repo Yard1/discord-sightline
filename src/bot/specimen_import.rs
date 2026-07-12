@@ -200,6 +200,7 @@ async fn download_and_hash_candidate(
         download_config.max_decoded_pixels,
         match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
         HashMode::Specimen,
     )
     .await
@@ -411,6 +412,7 @@ async fn generate_preview_variant(
         download_config.max_decoded_pixels,
         match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
         HashMode::Specimen,
     )
     .await

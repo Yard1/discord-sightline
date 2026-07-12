@@ -5,10 +5,11 @@
 )]
 
 use anyhow::{Context, Result, anyhow};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
-    fmt::Write as _,
+    fmt::{self, Write as _},
     time::Instant,
 };
 use twilight_model::id::{
@@ -17,6 +18,32 @@ use twilight_model::id::{
 };
 
 const LRU_ORDER_COMPACT_MULTIPLIER: usize = 4;
+
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Xxh128(u128);
+
+impl Xxh128 {
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    pub fn from_hex(value: &str) -> Option<Self> {
+        if value.len() != 32 {
+            return None;
+        }
+        u128::from_str_radix(value, 16).ok().map(Self)
+    }
+
+    pub fn short_hex(self) -> String {
+        format!("{:016x}", self.0 >> 64)
+    }
+}
+
+impl fmt::Display for Xxh128 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:032x}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,7 +241,7 @@ pub struct LocalImageHash {
     pub rotation_degrees: i16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ImageVisualSignature {
     pub luma_mean: u8,
     pub luma_std: u8,
@@ -504,16 +531,28 @@ pub(crate) struct LruDedupe {
 #[derive(Debug)]
 pub(crate) struct HashOutcomeLruCache {
     max_entries: usize,
-    entries: HashMap<String, CachedHashOutcomeEntry>,
-    order: VecDeque<(String, u64)>,
-    next_sequence: u64,
+    entries: FxHashMap<HashOutcomeCacheKey, usize>,
+    nodes: Vec<Option<HashOutcomeCacheNode>>,
+    free: Vec<usize>,
+    oldest: Option<usize>,
+    newest: Option<usize>,
+    guild_generations: FxHashMap<u64, u64>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CachedHashOutcomeEntry {
-    sequence: u64,
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+struct HashOutcomeCacheKey {
+    guild_id: u64,
+    generation: u64,
+    xxh128: Xxh128,
+}
+
+#[derive(Debug)]
+struct HashOutcomeCacheNode {
+    key: HashOutcomeCacheKey,
     policy_hash: u64,
     outcome: CachedDecisionOutcome,
+    older: Option<usize>,
+    newer: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -731,48 +770,60 @@ impl HashOutcomeLruCache {
     pub(crate) fn new(max_entries: usize) -> Self {
         Self {
             max_entries: max_entries.max(1),
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            next_sequence: 0,
+            entries: FxHashMap::default(),
+            nodes: Vec::new(),
+            free: Vec::new(),
+            oldest: None,
+            newest: None,
+            guild_generations: FxHashMap::default(),
         }
     }
 
-    pub(crate) fn get(&mut self, xxh128: &str, policy_hash: u64) -> Option<CachedDecisionOutcome> {
-        let entry = self.entries.get(xxh128)?;
-        if entry.policy_hash != policy_hash {
-            self.entries.remove(xxh128);
-            self.compact_order_if_needed();
+    pub(crate) fn get(
+        &mut self,
+        guild_id: u64,
+        xxh128: Xxh128,
+        policy_hash: u64,
+    ) -> Option<CachedDecisionOutcome> {
+        let key = self.key(guild_id, xxh128);
+        let index = self.entries.get(&key).copied()?;
+        if self.node(index).policy_hash != policy_hash {
+            self.remove_index(index);
             return None;
         }
-        let outcome = entry.outcome.clone();
-        self.touch(xxh128.to_owned());
+        let outcome = self.node(index).outcome.clone();
+        self.promote(index);
         Some(outcome)
     }
 
     pub(crate) fn insert_match(
         &mut self,
-        xxh128: String,
+        guild_id: u64,
+        xxh128: Xxh128,
         policy_hash: u64,
         outcome: &MatchOutcome,
     ) {
         self.insert_decision(
+            guild_id,
             xxh128,
             policy_hash,
             CachedDecisionOutcome::Match(CachedMatchOutcome::from(outcome)),
         );
     }
 
-    pub(crate) fn insert_pass(&mut self, xxh128: String, policy_hash: u64) {
-        self.insert_decision(xxh128, policy_hash, CachedDecisionOutcome::Pass);
+    pub(crate) fn insert_pass(&mut self, guild_id: u64, xxh128: Xxh128, policy_hash: u64) {
+        self.insert_decision(guild_id, xxh128, policy_hash, CachedDecisionOutcome::Pass);
     }
 
     pub(crate) fn insert_failure(
         &mut self,
-        xxh128: String,
+        guild_id: u64,
+        xxh128: Xxh128,
         policy_hash: u64,
         reason: impl Into<String>,
     ) {
         self.insert_decision(
+            guild_id,
             xxh128,
             policy_hash,
             CachedDecisionOutcome::Failure(truncate_chars(&reason.into(), 300)),
@@ -781,91 +832,135 @@ impl HashOutcomeLruCache {
 
     fn insert_decision(
         &mut self,
-        xxh128: String,
+        guild_id: u64,
+        xxh128: Xxh128,
         policy_hash: u64,
         outcome: CachedDecisionOutcome,
     ) {
-        let sequence = self.next_sequence();
-        match self.entries.entry(xxh128) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let cached = entry.get_mut();
-                cached.sequence = sequence;
-                cached.policy_hash = policy_hash;
-                cached.outcome = outcome;
-                self.order.push_back((entry.key().clone(), sequence));
-                self.compact_order_if_needed();
-                return;
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                self.order.push_back((entry.key().clone(), sequence));
-                entry.insert(CachedHashOutcomeEntry {
-                    sequence,
-                    policy_hash,
-                    outcome,
-                });
-            }
+        let key = self.key(guild_id, xxh128);
+        if let Some(index) = self.entries.get(&key).copied() {
+            let node = self.node_mut(index);
+            node.policy_hash = policy_hash;
+            node.outcome = outcome;
+            self.promote(index);
+            return;
         }
-        self.enforce_cap();
-    }
 
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
-        self.next_sequence = 0;
-    }
-
-    fn touch(&mut self, key: String) {
-        let sequence = self.next_sequence();
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.sequence = sequence;
-            self.order.push_back((key, sequence));
-            self.compact_order_if_needed();
+        if self.entries.len() >= self.max_entries
+            && let Some(index) = self.oldest
+        {
+            self.remove_index(index);
         }
+
+        let index = if let Some(index) = self.free.pop() {
+            self.nodes[index] = Some(HashOutcomeCacheNode {
+                key,
+                policy_hash,
+                outcome,
+                older: None,
+                newer: None,
+            });
+            index
+        } else {
+            let index = self.nodes.len();
+            self.nodes.push(Some(HashOutcomeCacheNode {
+                key,
+                policy_hash,
+                outcome,
+                older: None,
+                newer: None,
+            }));
+            index
+        };
+        self.entries.insert(key, index);
+        self.link_newest(index);
     }
 
-    fn next_sequence(&mut self) -> u64 {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        sequence
-    }
-
-    fn enforce_cap(&mut self) {
-        while self.entries.len() > self.max_entries {
-            let Some((key, sequence)) = self.order.pop_front() else {
-                self.compact_order();
-                if self.order.is_empty() {
-                    break;
-                }
-                continue;
-            };
-            if self
-                .entries
-                .get(&key)
-                .is_some_and(|entry| entry.sequence == sequence)
-            {
-                self.entries.remove(&key);
-            }
+    pub(crate) fn clear_guild(&mut self, guild_id: u64) {
+        let next = self
+            .guild_generations
+            .get(&guild_id)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        if next == 0 {
+            let max_entries = self.max_entries;
+            *self = Self::new(max_entries);
+            self.guild_generations.insert(guild_id, 1);
+        } else {
+            self.guild_generations.insert(guild_id, next);
         }
     }
 
-    fn compact_order_if_needed(&mut self) {
-        let max_order_len = self
-            .max_entries
-            .saturating_mul(LRU_ORDER_COMPACT_MULTIPLIER)
-            .max(64);
-        if self.order.len() > max_order_len {
-            self.compact_order();
+    fn key(&self, guild_id: u64, xxh128: Xxh128) -> HashOutcomeCacheKey {
+        HashOutcomeCacheKey {
+            guild_id,
+            generation: self.guild_generations.get(&guild_id).copied().unwrap_or(0),
+            xxh128,
         }
     }
 
-    fn compact_order(&mut self) {
-        let mut entries = self
-            .entries
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.sequence))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|(_, sequence)| *sequence);
-        self.order = entries.into();
+    fn promote(&mut self, index: usize) {
+        if self.newest == Some(index) {
+            return;
+        }
+        self.detach(index);
+        self.link_newest(index);
+    }
+
+    fn link_newest(&mut self, index: usize) {
+        let previous = self.newest;
+        {
+            let node = self.node_mut(index);
+            node.older = previous;
+            node.newer = None;
+        }
+        if let Some(previous) = previous {
+            self.node_mut(previous).newer = Some(index);
+        } else {
+            self.oldest = Some(index);
+        }
+        self.newest = Some(index);
+    }
+
+    fn detach(&mut self, index: usize) {
+        let (older, newer) = {
+            let node = self.node(index);
+            (node.older, node.newer)
+        };
+        if let Some(older) = older {
+            self.node_mut(older).newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.node_mut(newer).older = older;
+        } else {
+            self.newest = older;
+        }
+        let node = self.node_mut(index);
+        node.older = None;
+        node.newer = None;
+    }
+
+    fn remove_index(&mut self, index: usize) {
+        let key = self.node(index).key;
+        self.detach(index);
+        self.entries.remove(&key);
+        self.nodes[index] = None;
+        self.free.push(index);
+    }
+
+    fn node(&self, index: usize) -> &HashOutcomeCacheNode {
+        self.nodes[index]
+            .as_ref()
+            .expect("live cache index must reference a node")
+    }
+
+    fn node_mut(&mut self, index: usize) -> &mut HashOutcomeCacheNode {
+        self.nodes[index]
+            .as_mut()
+            .expect("live cache index must reference a node")
     }
 }
 
@@ -946,7 +1041,9 @@ impl CachedMatchOutcome {
 impl ImagePerfTracker {
     pub(crate) fn new(sample_cap: usize) -> Self {
         Self {
-            samples: VecDeque::with_capacity(sample_cap),
+            // Metrics are created per guild. Grow only when samples arrive so
+            // an idle guild does not eagerly reserve every history buffer.
+            samples: VecDeque::new(),
             sample_sum_ms: 0,
             total_count: 0,
             total_success: 0,
@@ -1066,33 +1163,74 @@ mod tests {
     #[test]
     fn hash_outcome_lru_cache_refreshes_hits_and_evicts_oldest() {
         let mut cache = HashOutcomeLruCache::new(2);
-        cache.insert_pass("a".to_owned(), 1);
-        cache.insert_pass("b".to_owned(), 1);
+        cache.insert_pass(1, Xxh128::new(10), 1);
+        cache.insert_pass(1, Xxh128::new(20), 1);
 
         assert!(matches!(
-            cache.get("a", 1),
+            cache.get(1, Xxh128::new(10), 1),
             Some(CachedDecisionOutcome::Pass)
         ));
 
-        cache.insert_pass("c".to_owned(), 1);
+        cache.insert_pass(1, Xxh128::new(30), 1);
 
-        assert!(cache.get("b", 1).is_none());
+        assert!(cache.get(1, Xxh128::new(20), 1).is_none());
         assert!(matches!(
-            cache.get("a", 1),
+            cache.get(1, Xxh128::new(10), 1),
             Some(CachedDecisionOutcome::Pass)
         ));
         assert!(matches!(
-            cache.get("c", 1),
+            cache.get(1, Xxh128::new(30), 1),
             Some(CachedDecisionOutcome::Pass)
         ));
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn hash_outcome_lru_cache_is_global_and_guild_scoped() {
+        let mut cache = HashOutcomeLruCache::new(2);
+        let hash = Xxh128::new(10);
+        cache.insert_pass(1, hash, 1);
+        cache.insert_pass(2, hash, 1);
+
+        assert!(cache.get(1, hash, 1).is_some());
+        assert!(cache.get(2, hash, 1).is_some());
+
+        cache.clear_guild(1);
+        assert!(cache.get(1, hash, 1).is_none());
+        assert!(cache.get(2, hash, 1).is_some());
+        // Generation invalidation is O(1); stale storage remains bounded by the
+        // global LRU cap and is reclaimed by subsequent insertions.
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn hash_outcome_lru_cache_storage_never_exceeds_global_cap() {
+        let mut cache = HashOutcomeLruCache::new(32);
+        for value in 0..10_000 {
+            cache.insert_pass(value % 7, Xxh128::new(value.into()), value % 3);
+        }
+
+        assert_eq!(cache.entries.len(), 32);
+        assert_eq!(cache.nodes.len(), 32);
+        assert!(cache.free.is_empty());
     }
 
     #[test]
     fn hash_outcome_lru_cache_drops_policy_mismatches() {
         let mut cache = HashOutcomeLruCache::new(2);
-        cache.insert_pass("a".to_owned(), 1);
+        let hash = Xxh128::new(10);
+        cache.insert_pass(1, hash, 1);
 
-        assert!(cache.get("a", 2).is_none());
-        assert!(cache.get("a", 1).is_none());
+        assert!(cache.get(1, hash, 2).is_none());
+        assert!(cache.get(1, hash, 1).is_none());
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn xxh128_hex_round_trips_and_shortens() {
+        let hash = Xxh128::new(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        assert_eq!(hash.to_string(), "0123456789abcdeffedcba9876543210");
+        assert_eq!(hash.short_hex(), "0123456789abcdef");
+        assert_eq!(Xxh128::from_hex(&hash.to_string()), Some(hash));
     }
 }

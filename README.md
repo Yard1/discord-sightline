@@ -69,10 +69,11 @@ needed if OCR is enabled in a guild.
 Copy `sightline.example.toml` to `sightline.toml` and adjust the limits as
 needed. This file sets the safety ceilings for the machine Sightline runs on:
 queue size and enqueue timeout, one CPU-bound concurrency budget, one download
-IO concurrency budget, one OCR IO concurrency budget, request timeouts, decoded
-pixel caps, local-anchor scan budgets, and the size of the LRU cache of hash
-results. It also configures the OCR.space endpoint, including timeout, retry
-count, language, scaling, and orientation detection.
+IO concurrency budget, one OCR IO concurrency budget, process-wide budgets for
+downloaded bodies and decoded images, a separate follow-up byte store, request
+timeouts, decoded pixel caps, local-anchor scan budgets, and the size of the
+global LRU cache of hash results. It also configures the OCR.space endpoint,
+including timeout, retry count, language, scaling, and orientation detection.
 
 The local `[download]` section can also enable a lightweight Discord CDN
 connection warmer. When `warmer_enabled = true`, Sightline uses the same image
@@ -124,11 +125,14 @@ delete a specimen message from a loaded channel, Sightline drops that specimen
 from the in-memory matcher and clears any cached results tied to it.
 
 The bot stays inactive until the config message exists and config is enabled. It
-also stops scanning (safe mode) if it can't load `sightline-db`. Use the Enable /
-Disable button in `/config` to turn scanning and moderation on or off. If you
-delete `sightline-db` while the bot is running, that guild's runtime is
-invalidated immediately, and scanning and moderation stay disabled until you
-recreate the channel and write configuration again.
+also stops scanning if it can't load `sightline-db`; failed loads retry every
+minute instead of caching an empty runtime. A guild forced into safe mode after
+a failed config write periodically reloads its last durable Discord state, and
+bot permissions are refreshed every five minutes so restored permissions resume
+scanning without a manual `/doctor`. Use the Enable / Disable button in `/config`
+to turn scanning and moderation on or off. If you delete `sightline-db` while the
+bot is running, its runtime is invalidated and retried until the replacement
+channel exists and contains configuration again.
 
 ### The /config panel
 
@@ -257,13 +261,15 @@ that passed.
 
 Concurrent downloads of the same Discord attachment URL are coalesced while they
 are in flight, so repost bursts do not start duplicate network requests for the
-same effective URL. Processed image outcomes are kept in an in-memory LRU cache,
-capped by
-`queue.hash_outcome_cache_size` (default and maximum `100000`). A reposted,
+same effective URL. Processed image outcomes are kept in a process-wide,
+guild-scoped O(1) in-memory LRU cache capped by
+`queue.hash_outcome_cache_size` (default and maximum `100000` across all
+guilds). A reposted,
 byte-identical image can reuse that snapshot after download and byte hashing —
 before decode and local hashing — but only while the current detection and
-text-gate policy still matches. The cache is cleared on guild config updates, is
-not persisted, and rebuilds naturally as the bot scans images after a restart.
+text-gate policy still matches. A guild's entries are invalidated when its
+specimens or effective matching state changes. The cache is not persisted and
+rebuilds naturally as the bot scans images after a restart.
 
 ## Discord setup
 

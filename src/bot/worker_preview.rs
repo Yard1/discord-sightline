@@ -42,21 +42,15 @@ pub(crate) async fn scan_preview_candidate(
     // hashing stay on the original image path so preview misses do not spend CPU
     // on evidence that cannot make the preview result decisive.
     let hash_mode = HashMode::candidate_without_local_hashes();
-    let preview_image_id = format!(
-        "preview_{}",
-        preview_downloaded
-            .byte_xxh128
-            .chars()
-            .take(16)
-            .collect::<String>()
-    );
-    let preview_xxh128 = preview_downloaded.byte_xxh128.clone();
+    let preview_image_id = format!("preview_{}", preview_downloaded.byte_xxh128.short_hex());
+    let preview_xxh128 = preview_downloaded.byte_xxh128.to_string();
     let fingerprint_started = Instant::now();
     let preview_fingerprint = hash_downloaded_image(
         preview_downloaded,
         context.download_config.max_decoded_pixels,
         context.match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
         hash_mode,
     )
     .await?;
@@ -185,6 +179,7 @@ pub(crate) async fn generate_specimen_preview_variant(
         download_config.max_decoded_pixels,
         match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
         HashMode::FullDiagnostics,
     )
     .await

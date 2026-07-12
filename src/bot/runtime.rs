@@ -6,11 +6,11 @@ use crate::{
         discord::{
             ADD_SPECIMEN_COMMAND, AUDIT_COMMAND, BotLogColor, BotLogEvent, CONFIG_COMMAND,
             DOCTOR_COMMAND, DiscordStorageState, EXPORT_HASHES_COMMAND, IMPORT_HASHES_COMMAND,
-            IMPORT_IMAGES_COMMAND, RenderedBotLog, STATS_COMMAND, VALIDATE_MESSAGE_COMMAND,
-            VERIFY_MESSAGE_COMMAND, check_bot_permissions, defer_ephemeral_interaction,
-            defer_update_interaction, edit_interaction_response, edit_interaction_response_data,
-            find_database_channel, load_ledger, message_jump_link, register_commands,
-            render_bot_log, respond_interaction,
+            IMPORT_IMAGES_COMMAND, RenderedBotLog, STATS_COMMAND, StoredSpecimen,
+            VALIDATE_MESSAGE_COMMAND, VERIFY_MESSAGE_COMMAND, check_bot_permissions,
+            defer_ephemeral_interaction, defer_update_interaction, edit_interaction_response,
+            edit_interaction_response_data, find_database_channel, load_ledger, message_jump_link,
+            register_commands, render_bot_log, respond_interaction,
         },
         effects::{DiscordEffects, TwilightDiscordEffects},
         event_stream::{BotEventStream, TwilightShardEventStream},
@@ -34,13 +34,13 @@ use crate::{
         },
     },
     image::{
-        matcher::{ExactHashIndex, Matcher},
+        matcher::{ExactHashIndex, Matcher, MatcherScratch},
         pipeline::{CpuGate, DownloadedImage, download_image, url_log_label},
         types::{
             HashOutcomeLruCache, ImageCandidate, ImageFingerprint, ImageFingerprintTimingSample,
             ImageMatchStageMetric, ImageMetricEvent, ImagePerfSample, ImagePerfTracker,
             ImageScanDecisionMetric, ImageStageTimingSample, LruDedupe, MatchOutcome,
-            TextGateResolutionMetric,
+            TextGateResolutionMetric, Xxh128,
         },
     },
     ocr_space::OcrSpaceClient,
@@ -48,10 +48,11 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet, mapref::entry::Entry};
+use futures_util::{StreamExt, stream};
 use parking_lot::{Mutex as StdMutex, RwLock as StdRwLock};
 use reqwest::{Client as ReqwestClient, redirect::Policy};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -64,7 +65,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use twilight_gateway::{Config as GatewayConfig, Event, Intents};
 use twilight_http::Client as DiscordClient;
 use twilight_model::{
@@ -80,6 +81,7 @@ use twilight_model::{
         },
     },
 };
+
 use url::Url;
 
 type GuildLoadLocks = DashMap<Id<GuildMarker>, Arc<AsyncMutex<()>>>;
@@ -90,12 +92,45 @@ type SpecimenHitCounts = DashMap<String, u64>;
 type MatchedMessageSet = DashSet<MessageScopeKey>;
 type SiblingInspectionMap = DashMap<MessageImageKey, MessageSiblingInspection>;
 type LoggedSiblingInspectionSet = DashSet<MessageImageKey>;
-type ImageByteStoreMap = DashMap<String, Weak<ImageByteLeaseInner>>;
+type ImageByteStoreMap = DashMap<Xxh128, Weak<ImageByteLeaseInner>>;
 type SharedDownloadResult = std::result::Result<DownloadedImage, Arc<str>>;
 type DownloadSingleflightMap = DashMap<String, Arc<OnceCell<SharedDownloadResult>>>;
 
+struct MatcherScratchPool {
+    available: StdMutex<Vec<MatcherScratch>>,
+    max_retained: usize,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeMatchVariant {
+    Original,
+    Preview,
+}
+
+impl MatcherScratchPool {
+    fn new(max_retained: usize) -> Self {
+        Self {
+            available: StdMutex::new(Vec::with_capacity(max_retained)),
+            max_retained: max_retained.max(1),
+        }
+    }
+
+    fn take(&self) -> MatcherScratch {
+        self.available.lock().pop().unwrap_or_default()
+    }
+
+    fn put(&self, scratch: MatcherScratch) {
+        let mut available = self.available.lock();
+        if available.len() < self.max_retained {
+            available.push(scratch);
+        }
+    }
+}
+
 const GUILD_LOAD_INFLIGHT_BACKOFF: Duration = Duration::from_secs(10);
 const GUILD_LOAD_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+const GUILD_HEALTH_CHECK_PERIOD: Duration = Duration::from_secs(60);
+const GUILD_PERMISSION_REFRESH_TICKS: u64 = 5;
 const IMAGE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(350);
 const DISCORD_CDN_WARMER_HOST: &str = "cdn.discordapp.com";
 const DISCORD_CDN_WARMER_URL: &str = "https://cdn.discordapp.com/embed/avatars/0.png";
@@ -103,7 +138,7 @@ const DISCORD_CDN_WARMER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct OcrCacheKey {
-    pub(crate) byte_xxh128: String,
+    pub(crate) byte_xxh128: Xxh128,
     pub(crate) policy_hash: u64,
 }
 
@@ -205,7 +240,7 @@ pub(crate) struct ImageByteLease {
 }
 
 struct ImageByteLeaseInner {
-    key: String,
+    key: Xxh128,
     bytes: bytes::Bytes,
     store: Weak<ImageByteStore>,
     _byte_permits: Vec<tokio::sync::OwnedSemaphorePermit>,
@@ -220,7 +255,7 @@ impl ImageByteLease {
 impl Drop for ImageByteLeaseInner {
     fn drop(&mut self) {
         if let Some(store) = self.store.upgrade() {
-            store.remove_if_dead(&self.key);
+            store.remove_if_dead(self.key);
         }
     }
 }
@@ -240,21 +275,21 @@ impl ImageByteStore {
 
     pub(crate) fn insert(
         self: &Arc<Self>,
-        key: String,
+        key: Xxh128,
         bytes: bytes::Bytes,
     ) -> Option<ImageByteLease> {
-        if let Some(existing) = self.get(&key) {
+        if let Some(existing) = self.get(key) {
             return Some(existing);
         }
         if bytes.is_empty() {
             return None;
         }
         let byte_permits = acquire_byte_permits(&self.byte_budget, bytes.len())?;
-        if let Some(existing) = self.get(&key) {
+        if let Some(existing) = self.get(key) {
             return Some(existing);
         }
         let inner = Arc::new(ImageByteLeaseInner {
-            key: key.clone(),
+            key,
             bytes,
             store: Arc::downgrade(self),
             _byte_permits: byte_permits,
@@ -263,19 +298,19 @@ impl ImageByteStore {
         Some(ImageByteLease { inner })
     }
 
-    fn get(&self, key: &str) -> Option<ImageByteLease> {
-        let entry = self.entries.get(key)?;
+    fn get(&self, key: Xxh128) -> Option<ImageByteLease> {
+        let entry = self.entries.get(&key)?;
         let Some(inner) = entry.value().upgrade() else {
             drop(entry);
-            self.entries.remove(key);
+            self.entries.remove(&key);
             return None;
         };
         Some(ImageByteLease { inner })
     }
 
-    fn remove_if_dead(&self, key: &str) {
+    fn remove_if_dead(&self, key: Xxh128) {
         self.entries
-            .remove_if(key, |_, value| value.strong_count() == 0);
+            .remove_if(&key, |_, value| value.strong_count() == 0);
     }
 }
 
@@ -311,15 +346,19 @@ pub(crate) struct BotState {
     pub(crate) image_http: ReqwestClient,
     pub(crate) ocr_space: Option<Arc<OcrSpaceClient>>,
     pub(crate) matcher_gate: Arc<CpuGate>,
+    matcher_scratch_pool: Arc<MatcherScratchPool>,
     pub(crate) guilds: Arc<DashMap<Id<GuildMarker>, Arc<GuildRuntime>>>,
     pub(crate) guild_load_locks: Arc<GuildLoadLocks>,
     pub(crate) guild_load_backoff: Arc<GuildLoadBackoff>,
     pub(crate) download_gate: Arc<Semaphore>,
+    pub(crate) download_memory_gate: Arc<Semaphore>,
+    pub(crate) decoded_image_memory_gate: Arc<Semaphore>,
     pub(crate) download_singleflight: Arc<DownloadSingleflightMap>,
     download_host_activity: Arc<DownloadHostActivity>,
     pub(crate) decode_gate: Arc<CpuGate>,
     pub(crate) image_byte_store: Arc<ImageByteStore>,
     pub(crate) dedupe: Arc<StdMutex<LruDedupe>>,
+    pub(crate) hash_outcome_cache: Arc<StdMutex<HashOutcomeLruCache>>,
     pub(crate) image_metrics_tx: mpsc::Sender<ImageMetricsCommand>,
     pub(crate) database_write_tx: mpsc::Sender<DatabaseWriteRequest>,
     pub(crate) bot_log_tx: mpsc::Sender<BotLogWriteRequest>,
@@ -337,14 +376,13 @@ pub(crate) struct BotState {
 pub(crate) struct GuildRuntime {
     pub(crate) guild_id: Id<GuildMarker>,
     pub(crate) matcher: Arc<StdRwLock<Matcher>>,
-    pub(crate) exact_hash_index: Arc<ArcSwap<ExactHashIndex>>,
+    pub(crate) exact_hash_index: Arc<StdRwLock<ExactHashIndex>>,
     pub(crate) guild_config: Arc<ArcSwap<GuildConfig>>,
     pub(crate) detection_policy_hash: Arc<AtomicU64>,
     pub(crate) guild_configured: Arc<AtomicBool>,
     pub(crate) storage: Arc<StdRwLock<DiscordStorageState>>,
     pub(crate) safe_mode: Arc<AtomicBool>,
     pub(crate) permissions_ok: Arc<AtomicBool>,
-    pub(crate) hash_outcome_cache: Arc<StdMutex<HashOutcomeLruCache>>,
     pub(crate) ocr_singleflight: Arc<OcrSingleflightMap>,
     pub(crate) hash_processing: Arc<HashProcessingMap>,
     pub(crate) specimen_hit_counts: Arc<SpecimenHitCounts>,
@@ -357,7 +395,7 @@ pub(crate) struct AppState {
     pub(crate) bot: BotState,
     pub(crate) guild_id: Id<GuildMarker>,
     pub(crate) matcher: Arc<StdRwLock<Matcher>>,
-    pub(crate) exact_hash_index: Arc<ArcSwap<ExactHashIndex>>,
+    pub(crate) exact_hash_index: Arc<StdRwLock<ExactHashIndex>>,
     pub(crate) guild_config: Arc<ArcSwap<GuildConfig>>,
     pub(crate) detection_policy_hash: Arc<AtomicU64>,
     pub(crate) guild_configured: Arc<AtomicBool>,
@@ -403,6 +441,15 @@ pub(crate) struct AddSpecimenWriteRequest {
     respond_to: oneshot::Sender<Result<SpecimenWriteOutcome>>,
 }
 
+struct PersistedSpecimenWrite {
+    state: AppState,
+    record: SpecimenRecord,
+    stored: StoredSpecimen,
+    channel_id: Id<ChannelMarker>,
+    log_context: SpecimenWriteLogContext,
+    respond_to: oneshot::Sender<Result<SpecimenWriteOutcome>>,
+}
+
 pub(crate) struct UpsertConfigWriteRequest {
     state: AppState,
     record: GuildConfigRecord,
@@ -424,6 +471,9 @@ enum BotLogWriteKind {
 
 pub(crate) enum ImageMetricsCommand {
     Record(ImageMetricEvent),
+    RemoveGuild {
+        guild_id: Id<GuildMarker>,
+    },
     Snapshot {
         guild_id: Id<GuildMarker>,
         respond_to: oneshot::Sender<GuildMetricsSnapshot>,
@@ -557,7 +607,7 @@ impl AppState {
 
     pub(crate) fn ocr_singleflight_cell(
         &self,
-        byte_xxh128: String,
+        byte_xxh128: Xxh128,
         policy_hash: u64,
     ) -> Arc<OnceCell<crate::image::engine::TextGateReport>> {
         let key = OcrCacheKey {
@@ -572,7 +622,7 @@ impl AppState {
 
     pub(crate) fn start_hash_processing(
         &self,
-        byte_xxh128: String,
+        byte_xxh128: Xxh128,
         policy_hash: u64,
     ) -> HashProcessingClaim {
         let key = OcrCacheKey {
@@ -845,59 +895,70 @@ impl AppState {
 
     pub(crate) fn contains_specimen_xxh128(&self, byte_xxh128: &str) -> bool {
         self.exact_hash_index
-            .load()
+            .read()
             .contains_byte_xxh128(byte_xxh128)
     }
 
-    pub(crate) async fn add_matcher_record(&self, record: SpecimenRecord) -> Result<()> {
+    pub(crate) async fn add_matcher_records(&self, records: Vec<SpecimenRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
         let matcher = Arc::clone(&self.matcher);
-        let policy = self.active_config_arc().detection_policy.clone();
-        let matcher_record = record.clone();
+        let exact_records = records.clone();
+        let matcher_permit = self.matcher_gate.acquire_low_priority().await?;
         tokio::task::spawn_blocking(move || {
-            matcher
-                .write()
-                .add_with_policy(matcher_record, Some(&policy));
+            let _matcher_permit = matcher_permit;
+            // The matcher already owns the currently published coherence
+            // threshold. Only config publication may replace it.
+            matcher.write().add_batch_with_policy(records, None);
         })
         .await
-        .context("matcher add task panicked")?;
-        self.exact_hash_index.rcu(|current| {
-            let mut next = (**current).clone();
-            next.add_record(&record);
-            Arc::new(next)
-        });
+        .context("matcher batch add task panicked")?;
+        let mut exact_hash_index = self.exact_hash_index.write();
+        for record in &exact_records {
+            exact_hash_index.add_record(record);
+        }
+        drop(exact_hash_index);
         self.invalidate_hash_decision_state();
         Ok(())
     }
 
     pub(crate) async fn remove_matcher_specimen(&self, specimen_id: String) -> Result<bool> {
+        // Remove from the hot exact path first. Concurrent scans that
+        // already observed the old entry linearize before this removal; later
+        // scans cannot return a stale exact match after this method completes.
+        self.exact_hash_index.write().remove_specimen(&specimen_id);
         let matcher = Arc::clone(&self.matcher);
         let matcher_specimen_id = specimen_id.clone();
+        let matcher_permit = self.matcher_gate.acquire_low_priority().await?;
         let removed = tokio::task::spawn_blocking(move || {
+            let _matcher_permit = matcher_permit;
             matcher.write().remove_specimen(&matcher_specimen_id)
         })
         .await
         .context("matcher remove task panicked")?;
         if removed {
-            self.exact_hash_index.rcu(|current| {
-                let mut next = (**current).clone();
-                next.remove_specimen(&specimen_id);
-                Arc::new(next)
-            });
             self.invalidate_hash_decision_state();
         }
         Ok(removed)
     }
 
     fn invalidate_hash_decision_state(&self) {
-        self.hash_outcome_cache.lock().clear();
+        self.hash_outcome_cache
+            .lock()
+            .clear_guild(self.guild_id.get());
         self.clear_hash_processing();
     }
 
     pub(crate) async fn refresh_matcher_policy(&self, policy: DetectionPolicy) -> Result<()> {
         let matcher = Arc::clone(&self.matcher);
-        tokio::task::spawn_blocking(move || matcher.write().set_coherence_policy(&policy))
-            .await
-            .context("matcher policy refresh task panicked")?;
+        let matcher_permit = self.matcher_gate.acquire_low_priority().await?;
+        tokio::task::spawn_blocking(move || {
+            let _matcher_permit = matcher_permit;
+            matcher.write().set_coherence_policy(&policy);
+        })
+        .await
+        .context("matcher policy refresh task panicked")?;
         Ok(())
     }
 
@@ -906,16 +967,8 @@ impl AppState {
         image: Arc<ImageFingerprint>,
         policy: DetectionPolicy,
     ) -> Result<Option<MatchOutcome>> {
-        let _matcher_permit = self
-            .bot
-            .matcher_gate
-            .acquire_high_priority()
+        self.find_match_for_policy_variant(image, policy, RuntimeMatchVariant::Original)
             .await
-            .context("matcher gate closed")?;
-        let matcher = Arc::clone(&self.matcher);
-        tokio::task::spawn_blocking(move || matcher.read().find_for_policy(image.as_ref(), &policy))
-            .await
-            .context("matcher task panicked")
     }
 
     pub(crate) async fn find_preview_match_for_policy(
@@ -923,29 +976,51 @@ impl AppState {
         image: Arc<ImageFingerprint>,
         policy: DetectionPolicy,
     ) -> Result<Option<MatchOutcome>> {
-        let _matcher_permit = self
+        self.find_match_for_policy_variant(image, policy, RuntimeMatchVariant::Preview)
+            .await
+    }
+
+    async fn find_match_for_policy_variant(
+        &self,
+        image: Arc<ImageFingerprint>,
+        policy: DetectionPolicy,
+        variant: RuntimeMatchVariant,
+    ) -> Result<Option<MatchOutcome>> {
+        let matcher_permit = self
             .bot
             .matcher_gate
             .acquire_high_priority()
             .await
             .context("matcher gate closed")?;
         let matcher = Arc::clone(&self.matcher);
+        let scratch_pool = Arc::clone(&self.bot.matcher_scratch_pool);
         tokio::task::spawn_blocking(move || {
-            matcher
-                .read()
-                .find_preview_for_policy(image.as_ref(), &policy)
+            let _matcher_permit = matcher_permit;
+            let mut scratch = scratch_pool.take();
+            let outcome = match variant {
+                RuntimeMatchVariant::Original => matcher.read().find_for_policy_with_scratch(
+                    image.as_ref(),
+                    &policy,
+                    &mut scratch,
+                ),
+                RuntimeMatchVariant::Preview => matcher
+                    .read()
+                    .find_preview_for_policy_with_scratch(image.as_ref(), &policy, &mut scratch),
+            };
+            scratch_pool.put(scratch);
+            outcome
         })
         .await
-        .context("preview matcher task panicked")
+        .context("matcher task panicked")
     }
 
     pub(crate) fn find_exact_xxh128_for_policy(
         &self,
-        byte_xxh128: &str,
+        byte_xxh128: Xxh128,
         policy: &DetectionPolicy,
     ) -> Option<MatchOutcome> {
         self.exact_hash_index
-            .load()
+            .read()
             .find_for_policy(byte_xxh128, policy)
     }
 
@@ -1007,6 +1082,7 @@ impl BotState {
                     mime_hint.as_deref(),
                     &download_config,
                     &download_gate,
+                    &self.download_memory_gate,
                 )
                 .await
                 .map_err(|source| Arc::<str>::from(source.to_string()))
@@ -1093,6 +1169,117 @@ async fn connection_warmer_loop(
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(period) => {}
+        }
+    }
+}
+
+fn spawn_guild_health_monitor(state: &BotState) {
+    let state = state.clone();
+    let shutdown = state.shutdown.clone();
+    state.background_tasks.clone().spawn(async move {
+        Box::pin(guild_health_monitor_loop(state, shutdown)).await;
+    });
+}
+
+async fn guild_health_monitor_loop(state: BotState, shutdown: CancellationToken) {
+    let mut interval = tokio::time::interval(GUILD_HEALTH_CHECK_PERIOD);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    let mut ticks = 0_u64;
+
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        ticks = ticks.wrapping_add(1);
+        let now = Instant::now();
+        let retryable = state
+            .guild_load_backoff
+            .iter()
+            .filter(|entry| *entry.value() <= now)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for guild_id in retryable {
+            state.request_guild_load(guild_id);
+        }
+
+        let runtimes = state
+            .guilds
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect::<Vec<_>>();
+        let refresh_permissions = ticks.is_multiple_of(GUILD_PERMISSION_REFRESH_TICKS);
+        stream::iter(runtimes)
+            .for_each_concurrent(4, |runtime| async {
+                if runtime.safe_mode.load(Ordering::Acquire) {
+                    if state
+                        .guild_load_backoff
+                        .get(&runtime.guild_id)
+                        .is_some_and(|retry_at| *retry_at > Instant::now())
+                    {
+                        return;
+                    }
+                    recover_safe_guild(&state, runtime).await;
+                } else if refresh_permissions && runtime.guild_configured.load(Ordering::Acquire) {
+                    let scoped = state.scoped_state(&runtime);
+                    if let Err(source) = scoped.refresh_bot_permissions().await {
+                        warn!(
+                            event = "permissions.periodic_check_failed",
+                            guild_id = runtime.guild_id.get(),
+                            ?source,
+                            "periodic bot permission refresh failed; retaining the last known state"
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+}
+
+async fn recover_safe_guild(state: &BotState, expected: Arc<GuildRuntime>) {
+    let guild_id = expected.guild_id;
+    let load_lock = match state.guild_load_locks.entry(guild_id) {
+        Entry::Occupied(entry) => Arc::clone(entry.get()),
+        Entry::Vacant(entry) => Arc::clone(&entry.insert(Arc::new(AsyncMutex::new(())))),
+    };
+    let _load_guard = load_lock.lock().await;
+    let still_current_and_safe = state.guilds.get(&guild_id).is_some_and(|current| {
+        Arc::ptr_eq(current.value(), &expected) && current.safe_mode.load(Ordering::Acquire)
+    });
+    if !still_current_and_safe {
+        return;
+    }
+
+    match state.load_guild_runtime(guild_id).await {
+        Ok(replacement) => {
+            let replaced = match state.guilds.entry(guild_id) {
+                Entry::Occupied(mut entry) if Arc::ptr_eq(entry.get(), &expected) => {
+                    entry.insert(replacement);
+                    true
+                }
+                _ => false,
+            };
+            if replaced {
+                state.guild_load_backoff.remove(&guild_id);
+                info!(
+                    event = "guild.safe_mode_recovered",
+                    guild_id = guild_id.get(),
+                    "reloaded durable guild state and left safe mode"
+                );
+            }
+        }
+        Err(source) => {
+            state
+                .guild_load_backoff
+                .insert(guild_id, Instant::now() + GUILD_LOAD_FAILURE_BACKOFF);
+            warn!(
+                event = "guild.safe_mode_recovery_failed",
+                guild_id = guild_id.get(),
+                retry_after_ms = GUILD_LOAD_FAILURE_BACKOFF.as_millis(),
+                ?source,
+                "could not reload durable guild state; remaining in safe mode"
+            );
         }
     }
 }
@@ -1256,7 +1443,11 @@ impl BotState {
             storage.specimens.clear();
         }
         *state.matcher.write() = Matcher::default();
-        state.hash_outcome_cache.lock().clear();
+        *state.exact_hash_index.write() = ExactHashIndex::default();
+        state
+            .hash_outcome_cache
+            .lock()
+            .clear_guild(state.guild_id().get());
         state.ocr_singleflight.clear();
         state.clear_hash_processing();
         state.guild_configured.store(false, Ordering::Release);
@@ -1264,7 +1455,8 @@ impl BotState {
         state.permissions_ok.store(false, Ordering::Release);
         self.guilds.remove(&guild_id);
         self.guild_load_locks.remove(&guild_id);
-        self.guild_load_backoff.remove(&guild_id);
+        self.guild_load_backoff
+            .insert(guild_id, Instant::now() + GUILD_LOAD_FAILURE_BACKOFF);
         self.clear_message_inspection_for_guild(guild_id);
 
         warn!(
@@ -1279,13 +1471,18 @@ impl BotState {
         let runtime = self.guilds.remove(&guild_id).map(|(_, runtime)| runtime);
         self.guild_load_locks.remove(&guild_id);
         self.guild_load_backoff.remove(&guild_id);
+        self.hash_outcome_cache.lock().clear_guild(guild_id.get());
         self.clear_message_inspection_for_guild(guild_id);
+        let metrics_tx = self.image_metrics_tx.clone();
+        self.background_tasks.spawn(async move {
+            let _ = metrics_tx
+                .send(ImageMetricsCommand::RemoveGuild { guild_id })
+                .await;
+        });
 
         if let Some(runtime) = runtime {
             *runtime.matcher.write() = Matcher::default();
-            runtime
-                .exact_hash_index
-                .store(Arc::new(ExactHashIndex::default()));
+            *runtime.exact_hash_index.write() = ExactHashIndex::default();
             {
                 let mut storage = runtime.storage.write();
                 storage.config_message_id = None;
@@ -1294,7 +1491,6 @@ impl BotState {
             runtime.guild_configured.store(false, Ordering::Release);
             runtime.safe_mode.store(true, Ordering::Release);
             runtime.permissions_ok.store(false, Ordering::Release);
-            runtime.hash_outcome_cache.lock().clear();
             runtime.ocr_singleflight.clear();
             let state = self.scoped_state(&runtime);
             state.clear_hash_processing();
@@ -1334,7 +1530,7 @@ impl BotState {
             storage: Arc::clone(&runtime.storage),
             safe_mode: Arc::clone(&runtime.safe_mode),
             permissions_ok: Arc::clone(&runtime.permissions_ok),
-            hash_outcome_cache: Arc::clone(&runtime.hash_outcome_cache),
+            hash_outcome_cache: Arc::clone(&self.hash_outcome_cache),
             ocr_singleflight: Arc::clone(&runtime.ocr_singleflight),
             hash_processing: Arc::clone(&runtime.hash_processing),
             specimen_hit_counts: Arc::clone(&runtime.specimen_hit_counts),
@@ -1348,7 +1544,7 @@ impl BotState {
             .await
             .context("finding sightline database channel")?;
 
-        let (records, loaded_guild_config, storage, safe_mode) = match load_ledger(
+        let load = load_ledger(
             &self.discord,
             &self.image_http,
             ledger_channel_id,
@@ -1358,30 +1554,16 @@ impl BotState {
             crate::bot::discord::LedgerRecoveryConfig {
                 base_match_config: &self.config.matching,
                 max_decoded_pixels: self.config.download.max_decoded_pixels,
+                decode_gate: &self.decode_gate,
+                decoded_memory_gate: &self.decoded_image_memory_gate,
             },
         )
         .await
-        {
-            Ok(load) => (load.specimens, load.guild_config, load.storage, false),
-            Err(source) => {
-                error!(
-                    event = "ledger.load_failed",
-                    guild_id = guild_id.get(),
-                    ?source,
-                    "guild ledger failed to load"
-                );
-                (
-                    Vec::new(),
-                    None,
-                    DiscordStorageState {
-                        channel_id: ledger_channel_id,
-                        config_message_id: None,
-                        specimens: Vec::new(),
-                    },
-                    true,
-                )
-            }
-        };
+        .with_context(|| format!("loading guild {} ledger", guild_id.get()))?;
+        let records = load.specimens;
+        let loaded_guild_config = load.guild_config;
+        let storage = load.storage;
+        let safe_mode = false;
         let guild_configured = loaded_guild_config.is_some();
         let guild_config = loaded_guild_config.unwrap_or_else(|| {
             GuildConfig::from_loaded_defaults(
@@ -1396,7 +1578,9 @@ impl BotState {
         let administrator_roles = self.load_administrator_role_ids(guild_id).await;
         let detection_policy_hash = guild_config.detection_cache_policy_hash();
         let matcher_policy = guild_config.detection_policy.clone();
+        let matcher_permit = self.matcher_gate.acquire_low_priority().await?;
         let (matcher, exact_hash_index) = tokio::task::spawn_blocking(move || {
+            let _matcher_permit = matcher_permit;
             let exact_hash_index = ExactHashIndex::new(&records);
             let matcher = Matcher::new_with_policy(records, &matcher_policy);
             (matcher, exact_hash_index)
@@ -1415,16 +1599,13 @@ impl BotState {
         let runtime = Arc::new(GuildRuntime {
             guild_id,
             matcher: Arc::new(StdRwLock::new(matcher)),
-            exact_hash_index: Arc::new(ArcSwap::from_pointee(exact_hash_index)),
+            exact_hash_index: Arc::new(StdRwLock::new(exact_hash_index)),
             guild_config: Arc::new(ArcSwap::from_pointee(guild_config)),
             detection_policy_hash: Arc::new(AtomicU64::new(detection_policy_hash)),
             guild_configured: Arc::new(AtomicBool::new(guild_configured)),
             storage: Arc::new(StdRwLock::new(storage)),
             safe_mode: Arc::new(AtomicBool::new(safe_mode)),
             permissions_ok: Arc::new(AtomicBool::new(false)),
-            hash_outcome_cache: Arc::new(StdMutex::new(HashOutcomeLruCache::new(
-                self.config.queue.hash_outcome_cache_size,
-            ))),
             ocr_singleflight: Arc::new(DashMap::new()),
             hash_processing: Arc::new(DashMap::new()),
             specimen_hit_counts: Arc::new(DashMap::new()),
@@ -1561,19 +1742,27 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
     let (detection_followup_tx, detection_followup_rx) = mpsc::channel(followup_queue_size);
     let (ocr_followup_tx, ocr_followup_rx) = mpsc::channel(followup_queue_size);
     let (original_auto_add_tx, original_auto_add_rx) = mpsc::channel(followup_queue_size);
-    let cpu_gate = Arc::new(CpuGate::new(config.queue.cpu_concurrency));
+    let cpu_concurrency = config.queue.cpu_concurrency;
+    let cpu_gate = Arc::new(CpuGate::new(cpu_concurrency));
     let shutdown = CancellationToken::new();
     let background_tasks = TaskTracker::new();
     let download_host_activity = Arc::new(DownloadHostActivity::default());
 
     let state = BotState {
         download_gate: Arc::new(Semaphore::new(config.queue.download_concurrency)),
+        download_memory_gate: Arc::new(Semaphore::new(config.queue.download_memory_max_bytes)),
+        decoded_image_memory_gate: Arc::new(Semaphore::new(
+            config.queue.decoded_image_memory_max_bytes,
+        )),
         download_singleflight: Arc::new(DashMap::new()),
         download_host_activity,
         decode_gate: Arc::clone(&cpu_gate),
         image_byte_store: Arc::new(ImageByteStore::new(config.queue.byte_store_max_bytes)),
         dedupe: Arc::new(StdMutex::new(LruDedupe::new(
             config.queue.max_size.saturating_mul(20),
+        ))),
+        hash_outcome_cache: Arc::new(StdMutex::new(HashOutcomeLruCache::new(
+            config.queue.hash_outcome_cache_size,
         ))),
         image_metrics_tx,
         database_write_tx,
@@ -1587,6 +1776,7 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
         discord_effects,
         image_http,
         ocr_space,
+        matcher_scratch_pool: Arc::new(MatcherScratchPool::new(cpu_concurrency)),
         matcher_gate: cpu_gate,
         guilds: Arc::new(DashMap::new()),
         guild_load_locks: Arc::new(DashMap::new()),
@@ -1602,6 +1792,7 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
         logged_sibling_inspections: Arc::new(DashSet::new()),
     };
     spawn_connection_warmer(&state);
+    spawn_guild_health_monitor(&state);
     info!(
         event = "startup.ready",
         bot_start_id = %state.bot_start_id,
@@ -1695,77 +1886,43 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
     gateway_result
 }
 
+const SPECIMEN_WRITE_DEBOUNCE: Duration = Duration::from_millis(40);
+const SPECIMEN_WRITE_MAX_BATCH_DELAY: Duration = Duration::from_millis(200);
+const SPECIMEN_WRITE_BATCH_LIMIT: usize = 64;
+
 async fn database_writer_loop(mut rx: mpsc::Receiver<DatabaseWriteRequest>) {
-    let mut writers: HashMap<Id<ChannelMarker>, mpsc::Sender<DatabaseWriteRequest>> =
-        HashMap::new();
-    let mut tasks = JoinSet::new();
-
-    while let Some(request) = rx.recv().await {
-        let channel_id = database_request_channel_id(&request);
-        let sender = writers.entry(channel_id).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(128);
-            tasks.spawn(database_channel_writer_loop(channel_id, rx));
-            tx
-        });
-        if let Err(source) = sender.send(request).await {
-            fail_database_request(source.0, anyhow!("database channel writer stopped"));
-            warn!(
-                event = "database_writer.route_failed",
-                channel_id = channel_id.get(),
-                "failed to route database write"
-            );
-        }
-    }
-
-    drop(writers);
-    while let Some(result) = tasks.join_next().await {
-        if let Err(source) = result {
-            warn!(
-                event = "database_channel_writer.join_failed",
-                ?source,
-                "database channel writer task failed during shutdown"
-            );
-        }
-    }
-}
-
-fn database_request_channel_id(request: &DatabaseWriteRequest) -> Id<ChannelMarker> {
-    match request {
-        DatabaseWriteRequest::AddSpecimen(request) => request.state.storage.read().channel_id,
-        DatabaseWriteRequest::UpsertConfig(request) => request.state.storage.read().channel_id,
-    }
-}
-
-fn fail_database_request(request: DatabaseWriteRequest, source: anyhow::Error) {
-    match request {
-        DatabaseWriteRequest::AddSpecimen(request) => {
-            let AddSpecimenWriteRequest { respond_to, .. } = *request;
-            let _ = respond_to.send(Err(source));
-        }
-        DatabaseWriteRequest::UpsertConfig(request) => {
-            let UpsertConfigWriteRequest { respond_to, .. } = *request;
-            let _ = respond_to.send(Err(source));
-        }
-    }
-}
-
-async fn database_channel_writer_loop(
-    channel_id: Id<ChannelMarker>,
-    mut rx: mpsc::Receiver<DatabaseWriteRequest>,
-) {
-    while let Some(request) = rx.recv().await {
+    let mut deferred = None;
+    loop {
+        let request = match deferred.take() {
+            Some(request) => request,
+            None => match rx.recv().await {
+                Some(request) => request,
+                None => break,
+            },
+        };
         match request {
-            DatabaseWriteRequest::AddSpecimen(request) => {
-                let AddSpecimenWriteRequest {
-                    state,
-                    record,
-                    image_attachments,
-                    log_context,
-                    respond_to,
-                } = *request;
-                let result =
-                    database_write_specimen(&state, record, image_attachments, log_context).await;
-                let _ = respond_to.send(result);
+            DatabaseWriteRequest::AddSpecimen(first) => {
+                let mut requests = vec![*first];
+                let batch_deadline = Instant::now() + SPECIMEN_WRITE_MAX_BATCH_DELAY;
+                while requests.len() < SPECIMEN_WRITE_BATCH_LIMIT {
+                    let wait = batch_deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(SPECIMEN_WRITE_DEBOUNCE);
+                    if wait.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(wait, rx.recv()).await {
+                        Ok(Some(DatabaseWriteRequest::AddSpecimen(request))) => {
+                            requests.push(*request);
+                        }
+                        Ok(Some(request)) => {
+                            deferred = Some(request);
+                            break;
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                database_write_specimen_batch(requests).await;
             }
             DatabaseWriteRequest::UpsertConfig(request) => {
                 let UpsertConfigWriteRequest {
@@ -1778,42 +1935,88 @@ async fn database_channel_writer_loop(
             }
         }
     }
-    info!(
-        event = "database_channel_writer.stopped",
-        channel_id = channel_id.get(),
-        "database channel writer stopped"
-    );
 }
 
-async fn database_write_specimen(
-    state: &AppState,
-    record: SpecimenRecord,
-    image_attachments: Vec<SpecimenImageAttachment>,
-    log_context: SpecimenWriteLogContext,
-) -> Result<SpecimenWriteOutcome> {
-    if state.contains_specimen_xxh128(&record.image.byte_xxh128) {
-        return Ok(SpecimenWriteOutcome::Duplicate);
+async fn database_write_specimen_batch(requests: Vec<AddSpecimenWriteRequest>) {
+    let mut hashes_in_batch = HashSet::new();
+    let mut persisted_by_runtime = HashMap::<(u64, usize), Vec<PersistedSpecimenWrite>>::new();
+
+    for request in requests {
+        let AddSpecimenWriteRequest {
+            state,
+            record,
+            image_attachments,
+            log_context,
+            respond_to,
+        } = request;
+        let hash_key = (state.guild_id().get(), record.image.byte_xxh128.clone());
+        if state.contains_specimen_xxh128(&record.image.byte_xxh128)
+            || !hashes_in_batch.insert(hash_key.clone())
+        {
+            let _ = respond_to.send(Ok(SpecimenWriteOutcome::Duplicate));
+            continue;
+        }
+
+        let channel_id = state.storage.read().channel_id;
+        match state
+            .discord_effects
+            .create_ledger_record_message(
+                channel_id,
+                record.clone(),
+                image_attachments,
+                state.secrets.specimen_hmac_secret.clone(),
+            )
+            .await
+        {
+            Ok(stored) => {
+                let runtime_key = (state.guild_id().get(), Arc::as_ptr(&state.matcher) as usize);
+                persisted_by_runtime
+                    .entry(runtime_key)
+                    .or_default()
+                    .push(PersistedSpecimenWrite {
+                        state,
+                        record,
+                        stored,
+                        channel_id,
+                        log_context,
+                        respond_to,
+                    });
+            }
+            Err(source) => {
+                hashes_in_batch.remove(&hash_key);
+                let _ = respond_to.send(Err(source));
+            }
+        }
     }
 
-    let channel_id = state.storage.read().channel_id;
-    let stored = state
-        .discord_effects
-        .create_ledger_record_message(
-            channel_id,
-            record.clone(),
-            image_attachments,
-            state.secrets.specimen_hmac_secret.clone(),
-        )
-        .await?;
-    let success = SpecimenWriteSuccess {
-        specimen_id: stored.specimen_id.clone(),
-        ledger_message_id: stored.message_id,
-        channel_id,
-    };
-    state.add_matcher_record(record.clone()).await?;
-    state.storage.write().specimens.push(stored);
-    log_specimen_database_write(state, &record, &success, &log_context).await;
-    Ok(SpecimenWriteOutcome::Added(success))
+    for (_, mut writes) in persisted_by_runtime {
+        let state = writes[0].state.clone();
+        let records = writes
+            .iter()
+            .map(|write| write.record.clone())
+            .collect::<Vec<_>>();
+        if let Err(source) = state.add_matcher_records(records).await {
+            let message = format!("batching persisted specimens into matcher failed: {source:#}");
+            for write in writes {
+                let _ = write.respond_to.send(Err(anyhow!(message.clone())));
+            }
+            continue;
+        }
+
+        for write in writes.drain(..) {
+            let success = SpecimenWriteSuccess {
+                specimen_id: write.stored.specimen_id.clone(),
+                ledger_message_id: write.stored.message_id,
+                channel_id: write.channel_id,
+            };
+            write.state.storage.write().specimens.push(write.stored);
+            log_specimen_database_write(&write.state, &write.record, &success, &write.log_context)
+                .await;
+            let _ = write
+                .respond_to
+                .send(Ok(SpecimenWriteOutcome::Added(success)));
+        }
+    }
 }
 
 async fn database_upsert_config(
@@ -2101,66 +2304,19 @@ async fn bot_log_writer_loop(
     discord: Arc<dyn DiscordEffects>,
     mut rx: mpsc::Receiver<BotLogWriteRequest>,
 ) {
-    let mut writers: HashMap<Id<ChannelMarker>, mpsc::Sender<BotLogWriteRequest>> = HashMap::new();
-    let mut tasks = JoinSet::new();
+    let mut last_config_logs =
+        HashMap::<Id<ChannelMarker>, (Id<UserMarker>, Id<MessageMarker>)>::new();
 
     while let Some(request) = rx.recv().await {
         let channel_id = request.channel_id;
-        let sender = writers.entry(channel_id).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(128);
-            tasks.spawn(bot_log_channel_writer_loop(
-                Arc::clone(&discord),
-                channel_id,
-                rx,
-            ));
-            tx
-        });
-        if let Err(source) = sender.try_send(request) {
-            let (request, reason) = match source {
-                mpsc::error::TrySendError::Full(request) => {
-                    (request, "bot log channel writer backlog full")
-                }
-                mpsc::error::TrySendError::Closed(request) => {
-                    (request, "bot log channel writer stopped")
-                }
-            };
-            if let Some(respond_to) = request.respond_to {
-                let _ = respond_to.send(Err(anyhow!(reason)));
-            }
-            warn!(
-                event = "bot_log.route_failed",
-                channel_id = channel_id.get(),
-                reason,
-                "failed to route bot log"
-            );
-        }
-    }
-
-    drop(writers);
-    while let Some(result) = tasks.join_next().await {
-        if let Err(source) = result {
-            warn!(
-                event = "bot_log_channel_writer.join_failed",
-                ?source,
-                "bot log channel writer task failed during shutdown"
-            );
-        }
-    }
-}
-
-async fn bot_log_channel_writer_loop(
-    discord: Arc<dyn DiscordEffects>,
-    channel_id: Id<ChannelMarker>,
-    mut rx: mpsc::Receiver<BotLogWriteRequest>,
-) {
-    let mut last_config_log: Option<(Id<UserMarker>, Id<MessageMarker>)> = None;
-    while let Some(request) = rx.recv().await {
         let result = match request.kind {
             BotLogWriteKind::ConfigUpdate { updated_by }
                 if request.respond_to.is_none()
-                    && last_config_log.is_some_and(|(last_user, _)| last_user == updated_by) =>
+                    && last_config_logs
+                        .get(&channel_id)
+                        .is_some_and(|(last_user, _)| *last_user == updated_by) =>
             {
-                let (_, message_id) = last_config_log.expect("checked above");
+                let (_, message_id) = last_config_logs[&channel_id];
                 discord
                     .edit_bot_log_in_channel(request.channel_id, message_id, request.log)
                     .await
@@ -2171,16 +2327,18 @@ async fn bot_log_channel_writer_loop(
                     .post_bot_log_to_channel(request.channel_id, request.log)
                     .await;
                 if let Ok(message_id) = result {
-                    last_config_log = match request.kind {
+                    match request.kind {
                         BotLogWriteKind::ConfigUpdate { updated_by }
                             if request.respond_to.is_none() =>
                         {
-                            Some((updated_by, message_id))
+                            last_config_logs.insert(channel_id, (updated_by, message_id));
                         }
-                        _ => None,
-                    };
+                        _ => {
+                            last_config_logs.remove(&channel_id);
+                        }
+                    }
                 } else {
-                    last_config_log = None;
+                    last_config_logs.remove(&channel_id);
                 }
                 result
             }
@@ -2188,7 +2346,7 @@ async fn bot_log_channel_writer_loop(
         if let Some(respond_to) = request.respond_to {
             let _ = respond_to.send(result);
         } else if let Err(source) = result {
-            last_config_log = None;
+            last_config_logs.remove(&channel_id);
             warn!(
                 event = "bot_log.post_failed",
                 channel_id = request.channel_id.get(),
@@ -2197,11 +2355,6 @@ async fn bot_log_channel_writer_loop(
             );
         }
     }
-    info!(
-        event = "bot_log_channel_writer.stopped",
-        channel_id = channel_id.get(),
-        "bot log channel writer stopped"
-    );
 }
 
 async fn performance_report_loop(mut rx: mpsc::Receiver<ImageMetricsCommand>) {
@@ -2220,6 +2373,9 @@ async fn performance_report_loop(mut rx: mpsc::Receiver<ImageMetricsCommand>) {
                 match command {
                     ImageMetricsCommand::Record(event) => {
                         record_image_metric_event(&mut trackers, &event);
+                    }
+                    ImageMetricsCommand::RemoveGuild { guild_id } => {
+                        trackers.remove(&guild_id);
                     }
                     ImageMetricsCommand::Snapshot { guild_id, respond_to } => {
                         let snapshot = trackers
@@ -2252,14 +2408,17 @@ struct GuildMetricsTracker {
 }
 
 impl GuildMetricsTracker {
+    const PERF_SAMPLE_CAP: usize = 512;
+    const TIMING_SAMPLE_CAP: usize = 512;
+
     fn new() -> Self {
         Self {
             period: GuildMetricCounters::default(),
             total: GuildMetricCounters::default(),
-            period_perf: ImagePerfTracker::new(4096),
-            total_perf: ImagePerfTracker::new(4096),
-            period_timing: PipelineTimingTracker::new(4096),
-            total_timing: PipelineTimingTracker::new(4096),
+            period_perf: ImagePerfTracker::new(Self::PERF_SAMPLE_CAP),
+            total_perf: ImagePerfTracker::new(Self::PERF_SAMPLE_CAP),
+            period_timing: PipelineTimingTracker::new(Self::TIMING_SAMPLE_CAP),
+            total_timing: PipelineTimingTracker::new(Self::TIMING_SAMPLE_CAP),
             period_timing_by_class: new_class_timing_trackers(),
             total_timing_by_class: new_class_timing_trackers(),
         }
@@ -2280,8 +2439,8 @@ impl GuildMetricsTracker {
 
     fn reset_period(&mut self) {
         self.period = GuildMetricCounters::default();
-        self.period_perf = ImagePerfTracker::new(4096);
-        self.period_timing = PipelineTimingTracker::new(4096);
+        self.period_perf = ImagePerfTracker::new(Self::PERF_SAMPLE_CAP);
+        self.period_timing = PipelineTimingTracker::new(Self::TIMING_SAMPLE_CAP);
         self.period_timing_by_class = new_class_timing_trackers();
     }
 }
@@ -2363,9 +2522,10 @@ impl PipelineTimingClass {
 }
 
 fn new_class_timing_trackers() -> Vec<PipelineTimingTracker> {
+    const CLASS_TIMING_SAMPLE_CAP: usize = 128;
     PipelineTimingClass::ALL
         .into_iter()
-        .map(|_| PipelineTimingTracker::new(1024))
+        .map(|_| PipelineTimingTracker::new(CLASS_TIMING_SAMPLE_CAP))
         .collect()
 }
 
@@ -2391,7 +2551,7 @@ struct TimingDistributionTracker {
 impl TimingDistributionTracker {
     fn new(sample_cap: usize) -> Self {
         Self {
-            samples: std::collections::VecDeque::with_capacity(sample_cap),
+            samples: std::collections::VecDeque::new(),
             sample_sum_us: 0,
             total_count: 0,
             sample_cap,
@@ -2862,6 +3022,9 @@ async fn log_effective_options(state: &AppState) {
         ocr_concurrency = state.config.queue.ocr_concurrency,
         max_images_per_message = state.config.queue.max_images_per_message,
         hash_outcome_cache_size = state.config.queue.hash_outcome_cache_size,
+        download_memory_max_bytes = state.config.queue.download_memory_max_bytes,
+        decoded_image_memory_max_bytes = state.config.queue.decoded_image_memory_max_bytes,
+        byte_store_max_bytes = state.config.queue.byte_store_max_bytes,
         exempt_administrators = config.scan_policy.exempt_administrators,
         max_bytes = state.config.download.max_bytes,
         max_decoded_pixels = state.config.download.max_decoded_pixels,
@@ -2887,7 +3050,7 @@ async fn log_effective_options(state: &AppState) {
     if configured {
         state
             .post_bot_log(format!(
-                "Sightline started.\nEnabled: `{}`\nDatabase channel: <#{}>\nBot log channel: {}\nModerator roles: {}\nScan-exempt roles: {}\nScan policy: {}\nAdvanced detection: {}\nActions: {}\nText gate: {}\nRuntime: max_images=`{}`, enqueue_timeout_ms=`{}`, hash_outcome_cache=`{}`, cpu_concurrency=`{}`, download_concurrency=`{}`, ocr_concurrency=`{}`, max_bytes=`{}`, max_pixels=`{}`, download_timeout=`{}s`, download_retries=`{}`, download_retry_base=`{}ms`, download_warmer=`{}`/`{}s`, pHash=`{}`, dHash=`{}`\nOCR.space: configured=`{}`, endpoint=`{}`, request_timeout=`{}s`, total_timeout=`{}s`, retries=`{}`, language=`{}`, scale=`{}`, orientation=`{}`",
+                "Sightline started.\nEnabled: `{}`\nDatabase channel: <#{}>\nBot log channel: {}\nModerator roles: {}\nScan-exempt roles: {}\nScan policy: {}\nAdvanced detection: {}\nActions: {}\nText gate: {}\nRuntime: max_images=`{}`, enqueue_timeout_ms=`{}`, hash_outcome_cache=`{}`, download_memory=`{}`, decoded_memory=`{}`, byte_store=`{}`, cpu_concurrency=`{}`, download_concurrency=`{}`, ocr_concurrency=`{}`, max_bytes=`{}`, max_pixels=`{}`, download_timeout=`{}s`, download_retries=`{}`, download_retry_base=`{}ms`, download_warmer=`{}`/`{}s`, pHash=`{}`, dHash=`{}`\nOCR.space: configured=`{}`, endpoint=`{}`, request_timeout=`{}s`, total_timeout=`{}s`, retries=`{}`, language=`{}`, scale=`{}`, orientation=`{}`",
                 config.enabled,
                 config.ledger_channel_id,
                 config
@@ -2913,6 +3076,9 @@ async fn log_effective_options(state: &AppState) {
                 state.config.queue.max_images_per_message,
                 state.config.queue.enqueue_timeout_ms,
                 state.config.queue.hash_outcome_cache_size,
+                state.config.queue.download_memory_max_bytes,
+                state.config.queue.decoded_image_memory_max_bytes,
+                state.config.queue.byte_store_max_bytes,
                 state.config.queue.cpu_concurrency,
                 state.config.queue.download_concurrency,
                 state.config.queue.ocr_concurrency,
@@ -3971,10 +4137,14 @@ fn resolved_target_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadHostActivity, should_defer_modal_as_ephemeral_response,
-        should_defer_modal_as_message_update, warmer_initial_delay,
+        DownloadHostActivity, ImageMetricsCommand, performance_report_loop,
+        should_defer_modal_as_ephemeral_response, should_defer_modal_as_message_update,
+        warmer_initial_delay,
     };
+    use crate::image::types::{ImageMetricEvent, TextGateResolutionMetric};
     use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot};
+    use twilight_model::id::{Id, marker::GuildMarker};
 
     #[test]
     fn config_modal_submits_defer_as_message_updates() {
@@ -4018,5 +4188,56 @@ mod tests {
 
         activity.touch_url("https://cdn.discordapp.com/attachments/1/2/image.png");
         assert!(activity.cdn_elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn removing_guild_evicts_metrics() {
+        let guild_id = Id::<GuildMarker>::new(1);
+        let (tx, rx) = mpsc::channel(8);
+        let task = tokio::spawn(performance_report_loop(rx));
+        tx.send(ImageMetricsCommand::Record(ImageMetricEvent::OcrResolved {
+            guild_id,
+            resolution: TextGateResolutionMetric::Good,
+        }))
+        .await
+        .expect("metrics receiver is running");
+
+        let (respond_to, response) = oneshot::channel();
+        tx.send(ImageMetricsCommand::Snapshot {
+            guild_id,
+            respond_to,
+        })
+        .await
+        .expect("metrics receiver is running");
+        assert_eq!(
+            response
+                .await
+                .expect("snapshot response")
+                .total
+                .ocr_resolved_good,
+            1
+        );
+
+        tx.send(ImageMetricsCommand::RemoveGuild { guild_id })
+            .await
+            .expect("metrics receiver is running");
+        let (respond_to, response) = oneshot::channel();
+        tx.send(ImageMetricsCommand::Snapshot {
+            guild_id,
+            respond_to,
+        })
+        .await
+        .expect("metrics receiver is running");
+        assert_eq!(
+            response
+                .await
+                .expect("snapshot response")
+                .total
+                .ocr_resolved_good,
+            0
+        );
+
+        drop(tx);
+        task.await.expect("metrics task exits cleanly");
     }
 }

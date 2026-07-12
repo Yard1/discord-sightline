@@ -40,6 +40,7 @@ use crate::{
             CachedDecisionOutcome, ImageCandidate, ImageFingerprint, ImageFingerprintTimingSample,
             ImageMatchStageMetric, ImageMetricEvent, ImagePerfSample, ImageScanDecisionMetric,
             ImageStageTimingSample, MatchConfidence, MatchOutcome, TextGateResolutionMetric,
+            Xxh128,
         },
     },
 };
@@ -59,6 +60,10 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const MODERATION_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+fn internal_xxh128(value: &str) -> Xxh128 {
+    Xxh128::from_hex(value).expect("internally generated fingerprint hash must be valid")
+}
 
 pub(crate) struct CandidateDecision {
     pub(crate) image_id: String,
@@ -270,8 +275,16 @@ pub(crate) async fn worker_loop(state: BotState, mut rx: mpsc::Receiver<ImageCan
                 None => break,
             },
         };
-        while tasks.len() >= worker_count {
-            join_logged_task(&mut tasks, "worker.task_failed", "image worker task failed").await;
+        if !wait_for_task_slot(
+            &mut tasks,
+            worker_count,
+            &state.shutdown,
+            "worker.task_failed",
+            "image worker task failed",
+        )
+        .await
+        {
+            break;
         }
 
         let state = state.clone();
@@ -594,7 +607,8 @@ async fn apply_detection_outcome(input: DetectionOutcomeInput) {
     }
     if ocr_followup.is_none() {
         state.hash_outcome_cache.lock().insert_match(
-            byte_xxh128.clone(),
+            state.guild_id().get(),
+            internal_xxh128(&byte_xxh128),
             policy_hash,
             &effective_outcome,
         );
@@ -765,13 +779,16 @@ pub(crate) async fn ocr_followup_loop(
             },
         };
         let concurrency = input.state.config.queue.ocr_concurrency;
-        while tasks.len() >= concurrency {
-            join_logged_task(
-                &mut tasks,
-                "ocr_followup.task_failed",
-                "OCR follow-up task failed",
-            )
-            .await;
+        if !wait_for_task_slot(
+            &mut tasks,
+            concurrency,
+            &shutdown,
+            "ocr_followup.task_failed",
+            "OCR follow-up task failed",
+        )
+        .await
+        {
+            break;
         }
         tasks.spawn(
             async move { run_ocr_followup(input).await }.instrument(info_span!("ocr_followup")),
@@ -805,14 +822,17 @@ pub(crate) async fn original_auto_add_loop(
                 None => break,
             },
         };
-        let concurrency = input.state.config.queue.original_auto_add_concurrency();
-        while tasks.len() >= concurrency {
-            join_logged_task(
-                &mut tasks,
-                "original_auto_add.task_failed",
-                "original auto-add task failed",
-            )
-            .await;
+        let concurrency = input.state.config.queue.cpu_concurrency.clamp(1, 4);
+        if !wait_for_task_slot(
+            &mut tasks,
+            concurrency,
+            &shutdown,
+            "original_auto_add.task_failed",
+            "original auto-add task failed",
+        )
+        .await
+        {
+            break;
         }
         tasks.spawn(
             async move { run_original_auto_add(input).await }
@@ -891,8 +911,12 @@ async fn run_original_auto_add(input: OriginalAutoAddInput) {
     else {
         return;
     };
-    let Some(original) = retain_image_bytes(&state, &candidate, &fingerprint.byte_xxh128, bytes)
-    else {
+    let Some(original) = retain_image_bytes(
+        &state,
+        &candidate,
+        internal_xxh128(&fingerprint.byte_xxh128),
+        bytes,
+    ) else {
         return;
     };
     let preview =
@@ -1000,6 +1024,7 @@ async fn hash_original_for_auto_add(
         download_config.max_decoded_pixels,
         match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
         HashMode::FullDiagnostics,
     )
     .await
@@ -1023,14 +1048,11 @@ async fn hash_original_for_auto_add(
 fn retain_image_bytes(
     state: &AppState,
     candidate: &ImageCandidate,
-    byte_xxh128: &str,
+    byte_xxh128: Xxh128,
     bytes: bytes::Bytes,
 ) -> Option<ImageByteLease> {
     let len = bytes.len();
-    let retained = state
-        .bot
-        .image_byte_store
-        .insert(byte_xxh128.to_owned(), bytes);
+    let retained = state.bot.image_byte_store.insert(byte_xxh128, bytes);
     if retained.is_none() {
         warn!(
             event = "image_byte_store.full",
@@ -1063,11 +1085,12 @@ async fn run_ocr_followup(input: OcrFollowupInput) {
         trace_id,
     } = input;
     let byte_xxh128 = followup.fingerprint.byte_xxh128.clone();
+    let xxh128 = internal_xxh128(&byte_xxh128);
     let ocr_key = OcrCacheKey {
-        byte_xxh128: byte_xxh128.clone(),
+        byte_xxh128: xxh128,
         policy_hash,
     };
-    let cell = state.ocr_singleflight_cell(byte_xxh128.clone(), policy_hash);
+    let cell = state.ocr_singleflight_cell(xxh128, policy_hash);
     let report = cell
         .get_or_init(|| async {
             run_single_ocr_followup(&state, &candidate, &image_id, &outcome, &followup).await
@@ -1086,12 +1109,14 @@ async fn run_ocr_followup(input: OcrFollowupInput) {
         state
             .hash_outcome_cache
             .lock()
-            .insert_pass(byte_xxh128, policy_hash);
+            .insert_pass(state.guild_id().get(), xxh128, policy_hash);
     } else {
-        state
-            .hash_outcome_cache
-            .lock()
-            .insert_match(byte_xxh128, policy_hash, &final_outcome);
+        state.hash_outcome_cache.lock().insert_match(
+            state.guild_id().get(),
+            xxh128,
+            policy_hash,
+            &final_outcome,
+        );
     }
     state.ocr_singleflight.remove(&ocr_key);
     if let Some(guard) = processing_guard.as_mut() {
@@ -1343,6 +1368,7 @@ async fn prepare_ocr_crops_for_followup(
         download_config.max_decoded_pixels,
         match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
     )
     .await
     {
@@ -1390,6 +1416,7 @@ async fn prepare_ocr_crops_by_redownload(
         download_config.max_decoded_pixels,
         match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
     )
     .await
     {
@@ -1558,14 +1585,17 @@ pub(crate) async fn detection_followup_loop(
                 None => break,
             },
         };
-        let concurrency = input.state.config.queue.detection_followup_concurrency();
-        while tasks.len() >= concurrency {
-            join_logged_task(
-                &mut tasks,
-                "detection_followup.task_failed",
-                "detection follow-up task failed",
-            )
-            .await;
+        let concurrency = input.state.config.queue.download_concurrency.clamp(1, 16);
+        if !wait_for_task_slot(
+            &mut tasks,
+            concurrency,
+            &shutdown,
+            "detection_followup.task_failed",
+            "detection follow-up task failed",
+        )
+        .await
+        {
+            break;
         }
         tasks.spawn(
             async move { detection_followup(input).await }
@@ -1593,6 +1623,26 @@ async fn join_logged_task(tasks: &mut JoinSet<()>, event: &'static str, message:
     {
         warn!(event, ?source, message);
     }
+}
+
+async fn wait_for_task_slot(
+    tasks: &mut JoinSet<()>,
+    concurrency: usize,
+    shutdown: &CancellationToken,
+    event: &'static str,
+    message: &'static str,
+) -> bool {
+    while tasks.len() >= concurrency.max(1) {
+        tokio::select! {
+            () = shutdown.cancelled() => return false,
+            result = tasks.join_next() => {
+                if let Some(Err(source)) = result {
+                    warn!(event, ?source, message);
+                }
+            }
+        }
+    }
+    true
 }
 
 async fn drain_joinset_on_shutdown(
@@ -2278,8 +2328,10 @@ async fn process_candidate(
             PreviewRoute::Precheck(preview) => preview,
         };
 
-    process_candidate_with_preview_precheck(state, candidate, started, &timings, &snapshot, preview)
-        .await
+    Box::pin(process_candidate_with_preview_precheck(
+        state, candidate, started, &timings, &snapshot, preview,
+    ))
+    .await
 }
 
 async fn process_candidate_with_preview_precheck(
@@ -2400,19 +2452,22 @@ async fn process_original_candidate(
         .await?;
     timings.download = downloaded.timings;
 
-    let image_id = downloaded.byte_xxh128.chars().take(16).collect::<String>();
-    let byte_xxh128 = downloaded.byte_xxh128.clone();
+    let xxh128 = downloaded.byte_xxh128;
+    let image_id = xxh128.short_hex();
+    let byte_xxh128 = xxh128.to_string();
 
     let exact_started = Instant::now();
     if let Some(outcome) =
-        state.find_exact_xxh128_for_policy(&downloaded.byte_xxh128, &guild_config.detection_policy)
+        state.find_exact_xxh128_for_policy(xxh128, &guild_config.detection_policy)
     {
         timings.exact_match_lookup_us = exact_started.elapsed().as_micros();
         timings.total_us = started.elapsed().as_micros();
-        state
-            .hash_outcome_cache
-            .lock()
-            .insert_match(byte_xxh128.clone(), policy_hash, &outcome);
+        state.hash_outcome_cache.lock().insert_match(
+            state.guild_id().get(),
+            xxh128,
+            policy_hash,
+            &outcome,
+        );
         info!(
             event = "exact_hash_cache.hit",
             image_id = %image_id,
@@ -2433,7 +2488,7 @@ async fn process_original_candidate(
     let lookup_started = Instant::now();
     let cached_outcome = {
         let mut cache = state.hash_outcome_cache.lock();
-        cache.get(&downloaded.byte_xxh128, policy_hash)
+        cache.get(state.guild_id().get(), xxh128, policy_hash)
     };
     if let Some(cached) = cached_outcome {
         timings.flagged_cache_lookup_us = lookup_started.elapsed().as_micros();
@@ -2443,7 +2498,7 @@ async fn process_original_candidate(
     timings.flagged_cache_lookup_us = lookup_started.elapsed().as_micros();
 
     let mut processing = loop {
-        match state.start_hash_processing(byte_xxh128.clone(), policy_hash) {
+        match state.start_hash_processing(xxh128, policy_hash) {
             HashProcessingClaim::Owner { key, complete } => {
                 break HashProcessingGuard::new(state.clone(), key, complete);
             }
@@ -2453,16 +2508,18 @@ async fn process_original_candidate(
                 timings.singleflight_wait_us = timings
                     .singleflight_wait_us
                     .saturating_add(wait_started.elapsed().as_micros());
-                if let Some(cached) = state
-                    .hash_outcome_cache
-                    .lock()
-                    .get(&byte_xxh128, policy_hash)
+                if let Some(cached) =
+                    state
+                        .hash_outcome_cache
+                        .lock()
+                        .get(state.guild_id().get(), xxh128, policy_hash)
                 {
-                    if let Some(outcome) = state
-                        .find_exact_xxh128_for_policy(&byte_xxh128, &guild_config.detection_policy)
+                    if let Some(outcome) =
+                        state.find_exact_xxh128_for_policy(xxh128, &guild_config.detection_policy)
                     {
                         state.hash_outcome_cache.lock().insert_match(
-                            byte_xxh128.clone(),
+                            state.guild_id().get(),
+                            xxh128,
                             policy_hash,
                             &outcome,
                         );
@@ -2494,7 +2551,7 @@ async fn process_original_candidate(
         state
             .hash_outcome_cache
             .lock()
-            .insert_pass(byte_xxh128.clone(), policy_hash);
+            .insert_pass(state.guild_id().get(), xxh128, policy_hash);
         processing.finish();
         return Ok(CandidateDecision::pass(
             reason,
@@ -2505,11 +2562,16 @@ async fn process_original_candidate(
     }
 
     let retained_original = if guild_config.text_gate_policy.enabled || auto_add_possible {
-        retain_image_bytes(state, candidate, &byte_xxh128, downloaded.bytes.clone())
+        retain_image_bytes(state, candidate, xxh128, downloaded.bytes.clone())
     } else {
         None
     };
-    let hash_mode = if detection_policy_needs_local_hashes(&guild_config.detection_policy) {
+    let policy = &guild_config.detection_policy;
+    let hash_mode = if policy.confirmed.threshold.local_anchors
+        || policy.confirmed.threshold.visual_shape
+        || policy.suspicious.threshold.local_anchors
+        || policy.suspicious.threshold.visual_shape
+    {
         HashMode::candidate()
     } else {
         HashMode::candidate_without_local_hashes()
@@ -2520,6 +2582,7 @@ async fn process_original_candidate(
         download_config.max_decoded_pixels,
         match_config,
         &state.decode_gate,
+        &state.bot.decoded_image_memory_gate,
     )
     .await
     {
@@ -2529,7 +2592,8 @@ async fn process_original_candidate(
         }
         Err(source) => {
             state.hash_outcome_cache.lock().insert_failure(
-                byte_xxh128.clone(),
+                state.guild_id().get(),
+                xxh128,
                 policy_hash,
                 source.to_string(),
             );
@@ -2558,10 +2622,12 @@ async fn process_original_candidate(
         };
         timings.fingerprint_us = fingerprint_started.elapsed().as_micros();
         timings.total_us = started.elapsed().as_micros();
-        state
-            .hash_outcome_cache
-            .lock()
-            .insert_match(byte_xxh128.clone(), policy_hash, &outcome);
+        state.hash_outcome_cache.lock().insert_match(
+            state.guild_id().get(),
+            xxh128,
+            policy_hash,
+            &outcome,
+        );
         processing.finish();
         let mut decision =
             CandidateDecision::matched(image_id, byte_xxh128, policy_hash, outcome, &timings);
@@ -2583,7 +2649,8 @@ async fn process_original_candidate(
         }
         Err(source) => {
             state.hash_outcome_cache.lock().insert_failure(
-                byte_xxh128.clone(),
+                state.guild_id().get(),
+                xxh128,
                 policy_hash,
                 source.to_string(),
             );
@@ -2725,12 +2792,14 @@ async fn process_original_candidate(
         state
             .hash_outcome_cache
             .lock()
-            .insert_pass(byte_xxh128.clone(), policy_hash);
+            .insert_pass(state.guild_id().get(), xxh128, policy_hash);
     } else if let Some(outcome) = progressive.outcome.as_ref() {
-        state
-            .hash_outcome_cache
-            .lock()
-            .insert_match(byte_xxh128.clone(), policy_hash, outcome);
+        state.hash_outcome_cache.lock().insert_match(
+            state.guild_id().get(),
+            xxh128,
+            policy_hash,
+            outcome,
+        );
     }
     processing.finish();
 
@@ -2783,15 +2852,6 @@ fn metadata_aspect_rejection_reason(
     (aspect > f64::from(match_config.local_max_aspect_ratio)).then_some("metadata_aspect_too_large")
 }
 
-pub(crate) fn detection_policy_needs_local_hashes(
-    policy: &crate::configuration::guild::DetectionPolicy,
-) -> bool {
-    policy.confirmed.threshold.local_anchors
-        || policy.confirmed.threshold.visual_shape
-        || policy.suspicious.threshold.local_anchors
-        || policy.suspicious.threshold.visual_shape
-}
-
 async fn add_matched_candidate_to_specimens_after_action(
     state: &AppState,
     candidate: &ImageCandidate,
@@ -2803,7 +2863,7 @@ async fn add_matched_candidate_to_specimens_after_action(
     let Some(specimen_candidate) = specimen_candidate else {
         return Some("already_known".to_owned());
     };
-    let byte_xxh128 = specimen_candidate.fingerprint.byte_xxh128.clone();
+    let byte_xxh128 = internal_xxh128(&specimen_candidate.fingerprint.byte_xxh128);
     match add_matched_candidate_to_specimens(
         state,
         candidate,
@@ -2814,7 +2874,7 @@ async fn add_matched_candidate_to_specimens_after_action(
     {
         Ok(Some(specimen_id)) => {
             let mut cache = state.hash_outcome_cache.lock();
-            cache.insert_match(byte_xxh128, policy_hash, outcome);
+            cache.insert_match(state.guild_id().get(), byte_xxh128, policy_hash, outcome);
             Some(specimen_id)
         }
         Ok(None) => Some("skipped_duplicate".to_owned()),
@@ -2869,13 +2929,15 @@ async fn add_matched_candidate_to_specimens(
         hash_downloaded_image(
             crate::image::pipeline::DownloadedImage {
                 bytes: bytes.clone(),
-                byte_xxh128: source_byte_xxh128,
+                byte_xxh128: internal_xxh128(&source_byte_xxh128),
                 mime: source_mime,
                 timings: DownloadTimings::default(),
+                _memory_reservation: None,
             },
             download_config.max_decoded_pixels,
             &match_config,
             &state.decode_gate,
+            &state.bot.decoded_image_memory_gate,
             HashMode::FullDiagnostics,
         )
         .await

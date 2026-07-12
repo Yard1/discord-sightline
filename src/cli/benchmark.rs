@@ -363,10 +363,15 @@ pub(super) fn benchmark_matcher(
     let matcher = matcher::Matcher::new(specimen_records);
     let matcher_build_ms = build_started.elapsed().as_millis();
     let policy = detection_policy_from_match_config(&config.matching);
+    let mut matcher_scratch = matcher::MatcherScratch::default();
 
     for _ in 0..options.warmup {
         for candidate in &candidates {
-            let _ = matcher.find_for_policy(&candidate.fingerprint, &policy);
+            let _ = matcher.find_for_policy_with_scratch(
+                &candidate.fingerprint,
+                &policy,
+                &mut matcher_scratch,
+            );
         }
         if options.pairwise {
             for specimen in &specimens {
@@ -407,6 +412,7 @@ fn benchmark_production_matcher_phase(
     options: &MatcherBenchmarkOptions,
 ) -> MatcherBenchmarkPhase {
     let started = Instant::now();
+    let mut matcher_scratch = matcher::MatcherScratch::default();
     let mut durations = Vec::with_capacity(candidates.len().saturating_mul(options.repeat));
     let mut per_candidate = Vec::new();
     let mut matched = 0usize;
@@ -420,7 +426,11 @@ fn benchmark_production_matcher_phase(
         let mut candidate_passed = 0usize;
         for _ in 0..options.repeat {
             let op_started = Instant::now();
-            let outcome = matcher.find_for_policy(&candidate.fingerprint, policy);
+            let outcome = matcher.find_for_policy_with_scratch(
+                &candidate.fingerprint,
+                policy,
+                &mut matcher_scratch,
+            );
             let elapsed = op_started.elapsed().as_micros();
             durations.push(elapsed);
             candidate_durations.push(elapsed);
@@ -669,7 +679,7 @@ fn parse_hash_mode(value: &str) -> Result<HashMode> {
         "specimen" => Ok(HashMode::Specimen),
         "full-diagnostics" => Ok(HashMode::FullDiagnostics),
         _ => Err(anyhow!(
-            "--mode must be one of candidate, specimen, or full-diagnostics"
+            "--mode must be one of candidate, candidate-no-local, specimen, or full-diagnostics"
         )),
     }
 }

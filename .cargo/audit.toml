@@ -1,0 +1,6 @@
+[advisories]
+# proc-macro-error2 is an optional dependency of jiff's defmt integration. It is
+# present in Cargo.lock but absent from `cargo tree --target all -e all`, so it
+# is not compiled for any Sightline target or enabled feature. Keep this scoped
+# exception until jiff removes or replaces that optional integration.
+ignore = ["RUSTSEC-2026-0173"]

@@ -73,14 +73,6 @@ pub enum Decision {
     NoHardAct(NoHardActInfo),
 }
 
-impl Decision {
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_hard_act(self) -> bool {
-        matches!(self, Self::HardAct(_))
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct CoherenceGraph {
     row_start: Vec<u32>,
@@ -120,20 +112,6 @@ impl CoherenceGraph {
         let start = self.row_start[specimen] as usize;
         let end = self.row_start[specimen + 1] as usize;
         (&self.col[start..end], &self.coh[start..end])
-    }
-
-    pub(crate) fn undirected_edges(
-        &self,
-    ) -> impl Iterator<Item = (SpecimenId, SpecimenId, u32)> + '_ {
-        (0..self.num_specimens())
-            .filter_map(|from| SpecimenId::try_from(from).ok())
-            .flat_map(|from| {
-                let (cols, coherences) = self.row(from);
-                cols.iter()
-                    .copied()
-                    .zip(coherences.iter().copied())
-                    .filter_map(move |(to, coherence)| (from < to).then_some((from, to, coherence)))
-            })
     }
 }
 
@@ -371,7 +349,10 @@ mod tests {
             inliers: 64,
             coverage_permille: 1_000,
         }];
-        assert!(scorer.score(&matches, &graph()).is_hard_act());
+        assert!(matches!(
+            scorer.score(&matches, &graph()),
+            Decision::HardAct(_)
+        ));
     }
 
     #[test]
@@ -389,7 +370,10 @@ mod tests {
                 coverage_permille: 1_000,
             },
         ];
-        assert!(scorer.score(&matches, &graph()).is_hard_act());
+        assert!(matches!(
+            scorer.score(&matches, &graph()),
+            Decision::HardAct(_)
+        ));
     }
 
     #[test]
@@ -430,6 +414,9 @@ mod tests {
                 coverage_permille: 1_000,
             },
         ];
-        assert!(!scorer.score(&matches, &graph()).is_hard_act());
+        assert!(matches!(
+            scorer.score(&matches, &graph()),
+            Decision::NoHardAct(_)
+        ));
     }
 }

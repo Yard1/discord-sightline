@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 use std::{env, fmt, fs, path::Path};
 use twilight_model::id::{Id, marker::UserMarker};
 
+pub const DECODED_MEMORY_BYTES_PER_PIXEL: u64 = 12;
+pub const DECODED_MEMORY_FIXED_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+
+pub const fn decoded_image_memory_reservation_bytes(pixels: u64) -> u64 {
+    pixels
+        .saturating_mul(DECODED_MEMORY_BYTES_PER_PIXEL)
+        .saturating_add(DECODED_MEMORY_FIXED_OVERHEAD_BYTES)
+}
+
 #[derive(Clone)]
 pub struct Secrets {
     pub discord_token: String,
@@ -91,20 +100,14 @@ pub struct QueueConfig {
     pub ocr_concurrency: usize,
     pub max_images_per_message: usize,
     pub hash_outcome_cache_size: usize,
+    pub download_memory_max_bytes: usize,
+    pub decoded_image_memory_max_bytes: usize,
     pub byte_store_max_bytes: usize,
 }
 
 impl QueueConfig {
     pub fn image_worker_concurrency(&self) -> usize {
         self.download_concurrency.max(self.cpu_concurrency)
-    }
-
-    pub fn original_auto_add_concurrency(&self) -> usize {
-        self.cpu_concurrency.clamp(1, 4)
-    }
-
-    pub fn detection_followup_concurrency(&self) -> usize {
-        self.download_concurrency.clamp(1, 16)
     }
 }
 
@@ -299,6 +302,8 @@ impl Default for QueueConfig {
             ocr_concurrency: 1,
             max_images_per_message: 4,
             hash_outcome_cache_size: 100_000,
+            download_memory_max_bytes: 128 * 1024 * 1024,
+            decoded_image_memory_max_bytes: 256 * 1024 * 1024,
             byte_store_max_bytes: 64 * 1024 * 1024,
         }
     }
@@ -528,16 +533,16 @@ fn validate_config(config: &AppConfig) -> Result<()> {
         "queue.enqueue_timeout_ms must be at most 1000"
     );
     anyhow::ensure!(
-        config.queue.cpu_concurrency > 0,
-        "queue.cpu_concurrency must be greater than 0"
+        (1..=64).contains(&config.queue.cpu_concurrency),
+        "queue.cpu_concurrency must be between 1 and 64"
     );
     anyhow::ensure!(
-        config.queue.download_concurrency > 0,
-        "queue.download_concurrency must be greater than 0"
+        (1..=256).contains(&config.queue.download_concurrency),
+        "queue.download_concurrency must be between 1 and 256"
     );
     anyhow::ensure!(
-        config.queue.ocr_concurrency > 0,
-        "queue.ocr_concurrency must be greater than 0"
+        (1..=32).contains(&config.queue.ocr_concurrency),
+        "queue.ocr_concurrency must be between 1 and 32"
     );
     anyhow::ensure!(
         config.queue.max_images_per_message > 0,
@@ -554,6 +559,26 @@ fn validate_config(config: &AppConfig) -> Result<()> {
     anyhow::ensure!(
         config.queue.hash_outcome_cache_size <= 100_000,
         "queue.hash_outcome_cache_size must be at most 100000"
+    );
+    anyhow::ensure!(
+        config.queue.download_memory_max_bytes >= config.download.max_bytes,
+        "queue.download_memory_max_bytes must be at least download.max_bytes"
+    );
+    anyhow::ensure!(
+        config.queue.download_memory_max_bytes <= 1024 * 1024 * 1024,
+        "queue.download_memory_max_bytes must be at most 1073741824"
+    );
+    let max_decoded_image_bytes = usize::try_from(decoded_image_memory_reservation_bytes(
+        config.download.max_decoded_pixels,
+    ))
+    .unwrap_or(usize::MAX);
+    anyhow::ensure!(
+        config.queue.decoded_image_memory_max_bytes >= max_decoded_image_bytes,
+        "queue.decoded_image_memory_max_bytes must cover the maximum decoded image working set"
+    );
+    anyhow::ensure!(
+        config.queue.decoded_image_memory_max_bytes <= 1024 * 1024 * 1024,
+        "queue.decoded_image_memory_max_bytes must be at most 1073741824"
     );
     anyhow::ensure!(
         config.queue.byte_store_max_bytes > 0,
@@ -1167,5 +1192,43 @@ mod tests {
 
         config.download.warmer_period_seconds = 270;
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn runtime_concurrency_and_download_memory_are_bounded() {
+        let mut config = AppConfig::default();
+
+        config.queue.cpu_concurrency = 65;
+        assert!(validate_config(&config).is_err());
+        config.queue.cpu_concurrency = 4;
+
+        config.queue.download_concurrency = 257;
+        assert!(validate_config(&config).is_err());
+        config.queue.download_concurrency = 64;
+
+        config.queue.ocr_concurrency = 33;
+        assert!(validate_config(&config).is_err());
+        config.queue.ocr_concurrency = 1;
+
+        config.queue.download_memory_max_bytes = config.download.max_bytes - 1;
+        assert!(validate_config(&config).is_err());
+        config.queue.download_memory_max_bytes = config.download.max_bytes;
+        assert!(validate_config(&config).is_ok());
+
+        config.queue.download_memory_max_bytes = 1024 * 1024 * 1024 + 1;
+        assert!(validate_config(&config).is_err());
+
+        let decoded_image_bytes = usize::try_from(decoded_image_memory_reservation_bytes(
+            config.download.max_decoded_pixels,
+        ))
+        .unwrap();
+        config.queue.download_memory_max_bytes = 128 * 1024 * 1024;
+        config.queue.decoded_image_memory_max_bytes = decoded_image_bytes - 1;
+        assert!(validate_config(&config).is_err());
+        config.queue.decoded_image_memory_max_bytes = decoded_image_bytes;
+        assert!(validate_config(&config).is_ok());
+
+        config.queue.decoded_image_memory_max_bytes = 1024 * 1024 * 1024 + 1;
+        assert!(validate_config(&config).is_err());
     }
 }

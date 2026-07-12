@@ -8,10 +8,12 @@
 )]
 
 use crate::{
-    configuration::app::{DownloadConfig, MatchConfig, PreviewDownloadMode},
+    configuration::app::{
+        DownloadConfig, MatchConfig, PreviewDownloadMode, decoded_image_memory_reservation_bytes,
+    },
     image::types::{
         CandidateKind, ImageAnchor, ImageCandidate, ImageFingerprint, ImageVisualSignature,
-        LocalImageHash,
+        LocalImageHash, Xxh128,
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -135,28 +137,32 @@ pub struct DownloadTimings {
 #[derive(Clone)]
 pub struct DownloadedImage {
     pub bytes: bytes::Bytes,
-    pub byte_xxh128: String,
+    pub byte_xxh128: Xxh128,
     pub mime: Option<String>,
     pub timings: DownloadTimings,
+    pub(crate) _memory_reservation: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 pub struct StagedImageFingerprint {
     pub fingerprint: ImageFingerprint,
     pub timings: PipelineTimings,
     image: DynamicImage,
+    _decoded_memory_reservation: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 pub struct CpuGate {
-    high_priority_tx: mpsc::UnboundedSender<CpuPermitRequest>,
-    low_priority_tx: mpsc::UnboundedSender<CpuPermitRequest>,
+    high_priority_tx: mpsc::Sender<CpuPermitRequest>,
+    low_priority_tx: mpsc::Sender<CpuPermitRequest>,
 }
 
 impl CpuGate {
     pub fn new(permits: usize) -> Self {
-        let (high_priority_tx, high_priority_rx) = mpsc::unbounded_channel();
-        let (low_priority_tx, low_priority_rx) = mpsc::unbounded_channel();
+        let permits = permits.max(1);
+        let queue_capacity = permits.saturating_mul(64).clamp(64, 4_096);
+        let (high_priority_tx, high_priority_rx) = mpsc::channel(queue_capacity);
+        let (low_priority_tx, low_priority_rx) = mpsc::channel(queue_capacity);
         tokio::spawn(cpu_gate_arbiter(
-            Arc::new(Semaphore::new(permits.max(1))),
+            Arc::new(Semaphore::new(permits)),
             high_priority_rx,
             low_priority_rx,
         ));
@@ -177,32 +183,44 @@ impl CpuGate {
 
 type CpuPermitRequest = oneshot::Sender<OwnedSemaphorePermit>;
 
-async fn acquire_cpu_permit(
-    tx: &mpsc::UnboundedSender<CpuPermitRequest>,
-) -> Result<OwnedSemaphorePermit> {
+async fn acquire_cpu_permit(tx: &mpsc::Sender<CpuPermitRequest>) -> Result<OwnedSemaphorePermit> {
     let (respond_to, response) = oneshot::channel();
     tx.send(respond_to)
+        .await
         .map_err(|_| anyhow!("CPU gate closed"))?;
     response.await.context("CPU gate stopped")
 }
 
 async fn cpu_gate_arbiter(
     permits: Arc<Semaphore>,
-    mut high_priority_rx: mpsc::UnboundedReceiver<CpuPermitRequest>,
-    mut low_priority_rx: mpsc::UnboundedReceiver<CpuPermitRequest>,
+    mut high_priority_rx: mpsc::Receiver<CpuPermitRequest>,
+    mut low_priority_rx: mpsc::Receiver<CpuPermitRequest>,
 ) {
     let mut high_closed = false;
     let mut low_closed = false;
+    let mut consecutive_high = 0_u8;
 
     while !high_closed || !low_closed {
         let Ok(permit) = permits.clone().acquire_owned().await else {
             break;
         };
+        if consecutive_high >= 8 && !low_closed {
+            match low_priority_rx.try_recv() {
+                Ok(request) => {
+                    let _ = request.send(permit);
+                    consecutive_high = 0;
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => low_closed = true,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
         tokio::select! {
             biased;
             request = high_priority_rx.recv(), if !high_closed => {
                 if let Some(request) = request {
                     let _ = request.send(permit);
+                    consecutive_high = consecutive_high.saturating_add(1);
                 } else {
                     drop(permit);
                     high_closed = true;
@@ -211,6 +229,7 @@ async fn cpu_gate_arbiter(
             request = low_priority_rx.recv(), if !low_closed => {
                 if let Some(request) = request {
                     let _ = request.send(permit);
+                    consecutive_high = 0;
                 } else {
                     drop(permit);
                     low_closed = true;
@@ -268,6 +287,7 @@ pub async fn download_image(
     mime_hint: Option<&str>,
     download_config: &DownloadConfig,
     download_gate: &Semaphore,
+    download_memory_gate: &Arc<Semaphore>,
 ) -> Result<DownloadedImage> {
     let total_started = Instant::now();
     validate_url(url)?;
@@ -281,7 +301,9 @@ pub async fn download_image(
         let download_permit = download_gate.acquire().await?;
         total_gate_wait_us = total_gate_wait_us.saturating_add(gate_started.elapsed().as_micros());
 
-        match download_image_attempt(http, url, mime_hint, download_config).await {
+        match download_image_attempt(http, url, mime_hint, download_config, download_memory_gate)
+            .await
+        {
             Ok(mut downloaded) => {
                 downloaded.timings.total_us = total_started.elapsed().as_micros();
                 downloaded.timings.gate_wait_us = total_gate_wait_us;
@@ -299,7 +321,8 @@ pub async fn download_image(
                 if error.retryable && attempt_number < max_attempts {
                     let delay = error
                         .retry_after
-                        .unwrap_or_else(|| download_retry_delay(download_config, attempt));
+                        .unwrap_or_else(|| download_retry_delay(download_config, attempt))
+                        .min(Duration::from_secs(download_config.timeout_seconds));
                     warn!(
                         event = "image.download_retry",
                         image_url = %url_log_label(url),
@@ -328,6 +351,7 @@ async fn download_image_attempt(
     url: &str,
     mime_hint: Option<&str>,
     download_config: &DownloadConfig,
+    download_memory_gate: &Arc<Semaphore>,
 ) -> std::result::Result<DownloadedImage, DownloadAttemptError> {
     let request_started = Instant::now();
     let response = http
@@ -350,16 +374,17 @@ async fn download_image_attempt(
     let cdn_age_seconds = cdn_age_seconds(response.headers());
     let (header_mime, content_length) =
         validate_download_response_metadata(&response, url, download_config, request_us)?;
-    let (bytes, body_us) = read_limited_response_body(
+    let (bytes, body_us, memory_reservation) = read_limited_response_body(
         response,
         content_length,
         download_config.max_bytes,
+        download_memory_gate,
         request_us,
     )
     .await?;
 
     let hash_started = Instant::now();
-    let byte_xxh128 = xxh128_hex(&bytes);
+    let byte_xxh128 = xxh128(&bytes);
     let xxh128_us = hash_started.elapsed().as_micros();
     let mime = header_mime.or_else(|| mime_hint.map(str::to_owned));
     let timings = DownloadTimings {
@@ -377,6 +402,7 @@ async fn download_image_attempt(
         byte_xxh128,
         mime,
         timings,
+        _memory_reservation: Some(memory_reservation),
     })
 }
 
@@ -448,13 +474,38 @@ async fn read_limited_response_body(
     response: reqwest::Response,
     content_length: Option<u64>,
     max_bytes: usize,
+    memory_gate: &Arc<Semaphore>,
     request_us: u128,
-) -> std::result::Result<(bytes::Bytes, u128), DownloadAttemptError> {
-    let initial_capacity = content_length.map_or(0, |length| (length as usize).min(max_bytes));
+) -> std::result::Result<(bytes::Bytes, u128, Arc<OwnedSemaphorePermit>), DownloadAttemptError> {
+    let body_started = Instant::now();
+    let reservation_bytes = content_length.map_or(max_bytes, |length| {
+        usize::try_from(length).unwrap_or(max_bytes)
+    });
+    let permit_count = u32::try_from(reservation_bytes.max(1)).map_err(|_| {
+        DownloadAttemptError::new(
+            anyhow!("image memory reservation exceeds semaphore limit"),
+            false,
+            request_us,
+            body_started.elapsed().as_micros(),
+        )
+    })?;
+    let memory_reservation = memory_gate
+        .clone()
+        .acquire_many_owned(permit_count)
+        .await
+        .map(Arc::new)
+        .map_err(|source| {
+            DownloadAttemptError::new(
+                anyhow::Error::new(source).context("acquiring image download memory budget"),
+                false,
+                request_us,
+                body_started.elapsed().as_micros(),
+            )
+        })?;
+    let initial_capacity = reservation_bytes.min(max_bytes);
     let mut body = BytesMut::with_capacity(initial_capacity);
     let mut stream = response.bytes_stream();
 
-    let body_started = Instant::now();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             let retryable = reqwest_error_is_retryable(&error);
@@ -485,11 +536,24 @@ async fn read_limited_response_body(
                 body_started.elapsed().as_micros(),
             ));
         }
+        if body.len().saturating_add(chunk.len()) > reservation_bytes {
+            return Err(DownloadAttemptError::new(
+                anyhow!(
+                    "image body exceeds reserved content-length; bytes_read={}; next_chunk={}; reserved_bytes={}",
+                    body.len(),
+                    chunk.len(),
+                    reservation_bytes
+                ),
+                false,
+                request_us,
+                body_started.elapsed().as_micros(),
+            ));
+        }
         body.extend_from_slice(&chunk);
     }
     let body_us = body_started.elapsed().as_micros();
 
-    Ok((body.freeze(), body_us))
+    Ok((body.freeze(), body_us, memory_reservation))
 }
 
 fn reqwest_error_is_retryable(error: &reqwest::Error) -> bool {
@@ -684,12 +748,15 @@ pub async fn hash_downloaded_image(
     max_pixels: u64,
     match_config: &MatchConfig,
     decode_gate: &Arc<CpuGate>,
+    decoded_memory_gate: &Arc<Semaphore>,
     mode: HashMode,
 ) -> Result<ImageFingerprint> {
     let match_config = match_config.clone();
+    let decoded_memory = reserve_decoded_image_memory(max_pixels, decoded_memory_gate).await?;
     let decode_permit = decode_gate.acquire_low_priority().await?;
     tokio::task::spawn_blocking(move || {
         let _decode_permit = decode_permit;
+        let _decoded_memory = decoded_memory;
         decode_and_hash_blocking_with_timings(
             downloaded.bytes.as_ref(),
             downloaded.byte_xxh128,
@@ -704,13 +771,42 @@ pub async fn hash_downloaded_image(
     .context("decode task panicked")?
 }
 
+pub(crate) async fn hash_image_bytes_gated(
+    bytes: bytes::Bytes,
+    mime: Option<String>,
+    max_pixels: u64,
+    match_config: &MatchConfig,
+    decode_gate: &Arc<CpuGate>,
+    decoded_memory_gate: &Arc<Semaphore>,
+    mode: HashMode,
+) -> Result<ImageFingerprint> {
+    let byte_xxh128 = xxh128(&bytes);
+    hash_downloaded_image(
+        DownloadedImage {
+            bytes,
+            byte_xxh128,
+            mime,
+            timings: DownloadTimings::default(),
+            _memory_reservation: None,
+        },
+        max_pixels,
+        match_config,
+        decode_gate,
+        decoded_memory_gate,
+        mode,
+    )
+    .await
+}
+
 pub async fn hash_downloaded_image_tier1(
     downloaded: DownloadedImage,
     max_pixels: u64,
     match_config: &MatchConfig,
     decode_gate: &Arc<CpuGate>,
+    decoded_memory_gate: &Arc<Semaphore>,
 ) -> Result<StagedImageFingerprint> {
     let match_config = match_config.clone();
+    let decoded_memory = reserve_decoded_image_memory(max_pixels, decoded_memory_gate).await?;
     let decode_permit = decode_gate.acquire_low_priority().await?;
     tokio::task::spawn_blocking(move || {
         let _decode_permit = decode_permit;
@@ -720,6 +816,7 @@ pub async fn hash_downloaded_image_tier1(
             downloaded.mime,
             max_pixels,
             &match_config,
+            Some(decoded_memory),
         )
     })
     .await
@@ -747,11 +844,14 @@ pub async fn prepare_ocr_payload_from_downloaded(
     max_pixels: u64,
     match_config: &MatchConfig,
     decode_gate: &Arc<CpuGate>,
+    decoded_memory_gate: &Arc<Semaphore>,
 ) -> Result<PreparedOcrCrop> {
     let match_config = match_config.clone();
+    let decoded_memory = reserve_decoded_image_memory(max_pixels, decoded_memory_gate).await?;
     let decode_permit = decode_gate.acquire_low_priority().await?;
     tokio::task::spawn_blocking(move || {
         let _decode_permit = decode_permit;
+        let _decoded_memory = decoded_memory;
         prepare_ocr_payload_from_bytes(bytes.as_ref(), max_pixels, &match_config)
     })
     .await
@@ -777,7 +877,7 @@ pub fn hash_image_bytes_with_timings(
 ) -> Result<(ImageFingerprint, PipelineTimings)> {
     let total_started = Instant::now();
     let hash_started = Instant::now();
-    let byte_xxh128 = xxh128_hex(bytes);
+    let byte_xxh128 = xxh128(bytes);
     let xxh128_us = hash_started.elapsed().as_micros();
     let (fingerprint, mut timings) = decode_and_hash_blocking_with_timings(
         bytes,
@@ -801,7 +901,7 @@ pub fn prepare_ocr_payload_from_bytes(
         .with_guessed_format()
         .context("guessing image format for OCR crops")?;
     let mut limits = Limits::default();
-    limits.max_alloc = Some(max_pixels.saturating_mul(4));
+    limits.max_alloc = Some(decoded_image_memory_reservation_bytes(max_pixels));
     reader.limits(limits);
     let source_mime = reader
         .format()
@@ -826,14 +926,20 @@ pub fn source_ocr_payload(
 
 fn decode_and_hash_blocking_with_timings(
     bytes: &[u8],
-    byte_xxh128: String,
+    byte_xxh128: Xxh128,
     mime: Option<String>,
     max_pixels: u64,
     match_config: &MatchConfig,
     mode: HashMode,
 ) -> Result<(ImageFingerprint, PipelineTimings)> {
-    let staged =
-        decode_tier1_blocking_with_timings(bytes, byte_xxh128, mime, max_pixels, match_config)?;
+    let staged = decode_tier1_blocking_with_timings(
+        bytes,
+        byte_xxh128,
+        mime,
+        max_pixels,
+        match_config,
+        None,
+    )?;
     Ok(complete_staged_fingerprint_blocking(
         staged,
         match_config,
@@ -843,10 +949,11 @@ fn decode_and_hash_blocking_with_timings(
 
 fn decode_tier1_blocking_with_timings(
     bytes: &[u8],
-    byte_xxh128: String,
+    byte_xxh128: Xxh128,
     mime: Option<String>,
     max_pixels: u64,
     match_config: &MatchConfig,
+    decoded_memory_reservation: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<StagedImageFingerprint> {
     let mut timings = PipelineTimings::default();
     let decode_started = Instant::now();
@@ -854,7 +961,7 @@ fn decode_tier1_blocking_with_timings(
         .with_guessed_format()
         .context("guessing image format")?;
     let mut limits = Limits::default();
-    limits.max_alloc = Some(max_pixels.saturating_mul(4));
+    limits.max_alloc = Some(decoded_image_memory_reservation_bytes(max_pixels));
     reader.limits(limits);
 
     let decoded_mime = reader
@@ -893,7 +1000,7 @@ fn decode_tier1_blocking_with_timings(
             width,
             height,
             mime: decoded_mime.or(mime),
-            byte_xxh128,
+            byte_xxh128: byte_xxh128.to_string(),
             phash64: hex::encode(phash.as_bytes()),
             dhash64: hex::encode(dhash.as_bytes()),
             visual,
@@ -902,6 +1009,7 @@ fn decode_tier1_blocking_with_timings(
         },
         timings,
         image,
+        _decoded_memory_reservation: decoded_memory_reservation,
     })
 }
 
@@ -961,8 +1069,23 @@ fn complete_staged_fingerprint_blocking(
     (fingerprint, timings)
 }
 
-pub fn xxh128_hex(bytes: &[u8]) -> String {
-    format!("{:032x}", xxh3_128(bytes))
+pub fn xxh128(bytes: &[u8]) -> Xxh128 {
+    Xxh128::new(xxh3_128(bytes))
+}
+
+async fn reserve_decoded_image_memory(
+    max_pixels: u64,
+    memory_gate: &Arc<Semaphore>,
+) -> Result<Arc<OwnedSemaphorePermit>> {
+    let reservation = decoded_image_memory_reservation_bytes(max_pixels);
+    let permits =
+        u32::try_from(reservation).context("decoded image reservation exceeds semaphore limit")?;
+    memory_gate
+        .clone()
+        .acquire_many_owned(permits.max(1))
+        .await
+        .map(Arc::new)
+        .context("decoded image memory gate closed")
 }
 
 fn compute_local_features(
@@ -2616,6 +2739,62 @@ mod tests {
     use twilight_model::id::Id;
 
     #[tokio::test]
+    async fn downloaded_image_clones_share_memory_reservation() {
+        let gate = Arc::new(Semaphore::new(16));
+        let reservation = gate
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .expect("memory gate is open");
+        let image = DownloadedImage {
+            bytes: bytes::Bytes::from_static(b"image"),
+            byte_xxh128: Xxh128::new(0),
+            mime: Some("image/jpeg".to_owned()),
+            timings: DownloadTimings::default(),
+            _memory_reservation: Some(Arc::new(reservation)),
+        };
+        assert_eq!(gate.available_permits(), 8);
+
+        let shared = image.clone();
+        drop(image);
+        assert_eq!(gate.available_permits(), 8);
+
+        drop(shared);
+        assert_eq!(gate.available_permits(), 16);
+    }
+
+    #[tokio::test]
+    async fn staged_image_holds_decoded_memory_reservation_until_consumed() {
+        let mut encoded = Vec::new();
+        DynamicImage::ImageRgb8(RgbImage::new(1, 1))
+            .write_to(&mut Cursor::new(&mut encoded), ImageFormat::Png)
+            .unwrap();
+        let reservation = usize::try_from(decoded_image_memory_reservation_bytes(100)).unwrap();
+        let decoded_memory_gate = Arc::new(Semaphore::new(reservation));
+        let downloaded = DownloadedImage {
+            byte_xxh128: xxh128(&encoded),
+            bytes: bytes::Bytes::from(encoded),
+            mime: Some("image/png".to_owned()),
+            timings: DownloadTimings::default(),
+            _memory_reservation: None,
+        };
+
+        let staged = hash_downloaded_image_tier1(
+            downloaded,
+            100,
+            &MatchConfig::default(),
+            &Arc::new(CpuGate::new(1)),
+            &decoded_memory_gate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decoded_memory_gate.available_permits(), 0);
+
+        drop(staged);
+        assert_eq!(decoded_memory_gate.available_permits(), reservation);
+    }
+
+    #[tokio::test]
     async fn cpu_gate_prioritizes_high_priority_waiters() {
         let gate = Arc::new(CpuGate::new(1));
         let first_permit = gate.acquire_low_priority().await.unwrap();
@@ -2868,11 +3047,11 @@ mod tests {
             .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
             .unwrap();
         let config = MatchConfig::default();
-        let byte_xxh128 = xxh128_hex(&bytes);
+        let byte_xxh128 = xxh128(&bytes);
 
         let full = decode_and_hash_blocking_with_timings(
             &bytes,
-            byte_xxh128.clone(),
+            byte_xxh128,
             Some("image/png".to_owned()),
             12_000_000,
             &config,
@@ -2886,6 +3065,7 @@ mod tests {
             Some("image/png".to_owned()),
             12_000_000,
             &config,
+            None,
         )
         .unwrap();
         let completed =
