@@ -3,8 +3,9 @@ use crate::{
         discord::{BotLogColor, BotLogEvent, message_jump_link, user_incident_label},
         runtime::{AppState, MessageImageKey, MessageScopeKey, MessageSiblingInspection},
     },
-    image::types::ImageCandidate,
+    image::types::{ImageCandidate, MatchOutcome},
 };
+use std::time::Instant;
 
 pub(crate) async fn log_scan_failure(
     state: &AppState,
@@ -58,6 +59,38 @@ pub(crate) async fn mark_message_matched(state: &AppState, candidate: &ImageCand
     }
 }
 
+pub(crate) async fn mark_message_scam_confirmed(
+    state: &AppState,
+    candidate: &ImageCandidate,
+    outcome: &MatchOutcome,
+) {
+    if !tracks_message_siblings(candidate)
+        || candidate.verify_only
+        || !state
+            .active_config_arc()
+            .scan_policy
+            .mark_message_siblings_suspicious
+    {
+        return;
+    }
+    prune_message_inspection_if_large(state);
+    let scope = MessageScopeKey::from_candidate(candidate);
+    state.confirmed_messages.insert(scope, outcome.clone());
+    let sibling_keys = state
+        .sibling_inspections
+        .iter()
+        .filter(|entry| entry.key().scope == scope && entry.key().image_url != candidate.url)
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    for key in sibling_keys {
+        if let Some((_, inspection)) = state.sibling_inspections.remove(&key) {
+            let sibling = inspection.candidate.clone();
+            log_sibling_inspection_once(state, key, inspection).await;
+            queue_sibling_escalation(state, sibling, outcome.clone());
+        }
+    }
+}
+
 pub(crate) async fn record_nonmatching_sibling_inspection(
     state: &AppState,
     candidate: &ImageCandidate,
@@ -84,8 +117,42 @@ pub(crate) async fn record_nonmatching_sibling_inspection(
         .sibling_inspections
         .insert(key.clone(), inspection.clone());
     if state.matched_messages.contains(&key.scope) {
-        log_sibling_inspection_once(state, key, inspection).await;
+        log_sibling_inspection_once(state, key.clone(), inspection.clone()).await;
     }
+    let source = state
+        .confirmed_messages
+        .get(&key.scope)
+        .map(|entry| entry.value().clone());
+    if let Some(source) = source
+        && let Some((_, inspection)) = state.sibling_inspections.remove(&key)
+    {
+        queue_sibling_escalation(state, inspection.candidate, source);
+    }
+}
+
+fn queue_sibling_escalation(state: &AppState, mut candidate: ImageCandidate, source: MatchOutcome) {
+    if candidate.verify_only || candidate.sibling_escalation_source.is_some() {
+        return;
+    }
+
+    candidate.sibling_escalation_source = Some(Box::new(source));
+    candidate.enqueued_at = Some(Instant::now());
+    let tx = state.bot.image_tx.clone();
+    let shutdown = state.bot.shutdown.clone();
+    state.bot.background_tasks.spawn(async move {
+        tokio::select! {
+            () = shutdown.cancelled() => {}
+            result = tx.send(candidate) => {
+                if let Err(source) = result {
+                    tracing::warn!(
+                        event = "message_sibling.enqueue_failed",
+                        ?source,
+                        "failed to enqueue suspicious message sibling"
+                    );
+                }
+            }
+        }
+    });
 }
 
 async fn log_sibling_inspection_once(
@@ -150,6 +217,7 @@ fn prune_message_inspection_if_large(state: &AppState) {
     }
     let mut excess = tracked.saturating_sub(cap);
     prune_dash_map(&state.sibling_inspections, &mut excess);
+    prune_dash_map(&state.confirmed_messages, &mut excess);
     prune_dash_set(&state.logged_sibling_inspections, &mut excess);
     prune_dash_set(&state.matched_messages, &mut excess);
 }
@@ -158,6 +226,7 @@ fn tracked_message_state_len(state: &AppState) -> usize {
     state
         .sibling_inspections
         .len()
+        .saturating_add(state.confirmed_messages.len())
         .saturating_add(state.logged_sibling_inspections.len())
         .saturating_add(state.matched_messages.len())
 }

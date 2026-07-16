@@ -123,6 +123,13 @@ order:
 Exact matches short-circuit only for original fingerprints, not for Discord
 preview variants.
 
+With the per-guild `scan_policy.mark_message_siblings_suspicious` flag,
+confirmation also becomes message-scoped evidence. A hard match records that
+evidence immediately; a suspicious match records it only when OCR confirms bad
+text. Sibling candidates that otherwise passed are requeued once as contextual
+`message_sibling` suspicious decisions and use OCR when the text gate is enabled.
+These contextual decisions are not written to the global hash-outcome cache.
+
 ## 8. Local matching and geometry
 
 Local matching has two related evidence paths. The selected local-anchor path

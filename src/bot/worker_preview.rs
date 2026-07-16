@@ -261,5 +261,6 @@ pub(crate) fn preview_outcome_allows_early_exit(outcome: &MatchOutcome) -> bool 
                 | MatchConfidence::LocalAnchors
                 | MatchConfidence::ClusterCoherence
                 | MatchConfidence::DenseLocalAnchors
+                | MatchConfidence::MessageSibling
         )
 }

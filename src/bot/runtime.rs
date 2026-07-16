@@ -90,6 +90,7 @@ type OcrSingleflightMap = DashMap<OcrCacheKey, Arc<OnceCell<crate::image::engine
 type HashProcessingMap = DashMap<OcrCacheKey, Arc<watch::Sender<bool>>>;
 type SpecimenHitCounts = DashMap<String, u64>;
 type MatchedMessageSet = DashSet<MessageScopeKey>;
+type ConfirmedMessageMap = DashMap<MessageScopeKey, MatchOutcome>;
 type SiblingInspectionMap = DashMap<MessageImageKey, MessageSiblingInspection>;
 type LoggedSiblingInspectionSet = DashSet<MessageImageKey>;
 type ImageByteStoreMap = DashMap<Xxh128, Weak<ImageByteLeaseInner>>;
@@ -365,10 +366,12 @@ pub(crate) struct BotState {
     pub(crate) detection_followup_tx: mpsc::Sender<DetectionFollowup>,
     pub(crate) ocr_followup_tx: mpsc::Sender<OcrFollowupInput>,
     pub(crate) original_auto_add_tx: mpsc::Sender<OriginalAutoAddInput>,
+    pub(crate) image_tx: mpsc::Sender<ImageCandidate>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) background_tasks: TaskTracker,
     pub(crate) interaction_gate: Arc<Semaphore>,
     pub(crate) matched_messages: Arc<MatchedMessageSet>,
+    pub(crate) confirmed_messages: Arc<ConfirmedMessageMap>,
     pub(crate) sibling_inspections: Arc<SiblingInspectionMap>,
     pub(crate) logged_sibling_inspections: Arc<LoggedSiblingInspectionSet>,
 }
@@ -1512,6 +1515,8 @@ impl BotState {
     fn clear_message_inspection_for_guild(&self, guild_id: Id<GuildMarker>) {
         self.matched_messages
             .retain(|scope| scope.guild_id != guild_id);
+        self.confirmed_messages
+            .retain(|scope, _| scope.guild_id != guild_id);
         self.sibling_inspections
             .retain(|key, _| key.scope.guild_id != guild_id);
         self.logged_sibling_inspections
@@ -1748,6 +1753,7 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
     let background_tasks = TaskTracker::new();
     let download_host_activity = Arc::new(DownloadHostActivity::default());
 
+    let (image_tx, image_rx) = mpsc::channel(config.queue.max_size);
     let state = BotState {
         download_gate: Arc::new(Semaphore::new(config.queue.download_concurrency)),
         download_memory_gate: Arc::new(Semaphore::new(config.queue.download_memory_max_bytes)),
@@ -1785,9 +1791,11 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
         detection_followup_tx,
         ocr_followup_tx,
         original_auto_add_tx,
+        image_tx: image_tx.clone(),
         shutdown,
         background_tasks,
         matched_messages: Arc::new(DashSet::new()),
+        confirmed_messages: Arc::new(DashMap::new()),
         sibling_inspections: Arc::new(DashMap::new()),
         logged_sibling_inspections: Arc::new(DashSet::new()),
     };
@@ -1799,8 +1807,7 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
         "sightline startup complete"
     );
 
-    let (tx, rx) = mpsc::channel(state.config.queue.max_size);
-    let worker_task = tokio::spawn(worker_loop(state.clone(), rx));
+    let worker_task = tokio::spawn(worker_loop(state.clone(), image_rx));
     let followup_task = tokio::spawn(detection_followup_loop(
         state.shutdown.clone(),
         detection_followup_rx,
@@ -1820,7 +1827,7 @@ pub(crate) async fn run_bot(config: AppConfig) -> Result<()> {
 
     let shutdown = state.shutdown.clone();
     let background_tasks = state.background_tasks.clone();
-    let gateway_result = run_gateway(state.clone(), tx).await;
+    let gateway_result = run_gateway(state.clone(), image_tx).await;
     shutdown.cancel();
     background_tasks.close();
     if tokio::time::timeout(Duration::from_secs(10), background_tasks.wait())

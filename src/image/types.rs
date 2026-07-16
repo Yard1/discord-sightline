@@ -74,6 +74,8 @@ pub struct ImageCandidate {
     #[serde(skip)]
     pub verify_only: bool,
     #[serde(skip)]
+    pub sibling_escalation_source: Option<Box<MatchOutcome>>,
+    #[serde(skip)]
     pub enqueued_at: Option<Instant>,
 }
 
@@ -1107,6 +1109,7 @@ pub enum MatchConfidence {
     SuspiciousPerceptual,
     SuspiciousLocalAnchors,
     SuspiciousDenseLocalAnchors,
+    MessageSibling,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]

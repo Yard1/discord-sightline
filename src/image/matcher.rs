@@ -3829,7 +3829,9 @@ fn stage_weight(confidence: MatchConfidence, threshold: &DetectionThreshold) -> 
         MatchConfidence::DenseLocalAnchors | MatchConfidence::SuspiciousDenseLocalAnchors => {
             threshold.dense_local_anchor_score_weight
         }
-        MatchConfidence::ExactXxh128 | MatchConfidence::ClusterCoherence => 0.0,
+        MatchConfidence::ExactXxh128
+        | MatchConfidence::ClusterCoherence
+        | MatchConfidence::MessageSibling => 0.0,
     }
 }
 

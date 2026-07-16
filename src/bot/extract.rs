@@ -134,6 +134,7 @@ fn append_candidates_from_media(
                 metadata_height: attachment.height.and_then(u64_to_u32),
                 media_flags: attachment.flags.map(|flags| flags.bits()),
                 verify_only: false,
+                sibling_escalation_source: None,
                 enqueued_at: None,
             });
         }
@@ -172,6 +173,7 @@ fn append_candidates_from_media(
                     metadata_height: media.height,
                     media_flags: None,
                     verify_only: false,
+                    sibling_escalation_source: None,
                     enqueued_at: None,
                 });
             }

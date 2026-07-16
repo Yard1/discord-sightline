@@ -1809,6 +1809,7 @@ async fn import_uploaded_images(
                 .and_then(|value| u32::try_from(value).ok()),
             media_flags: attachment.flags.map(|flags| flags.bits()),
             verify_only: false,
+            sibling_escalation_source: None,
             enqueued_at: None,
         });
     }
@@ -2786,6 +2787,7 @@ mod tests {
         config.discord_benign_log_message = "benign".to_owned();
         config.discord_detection_log_message = "legacy".to_owned();
         config.scan_policy.exempt_administrators = false;
+        config.scan_policy.mark_message_siblings_suspicious = true;
         config.detection_policy.confirmed.actions.delete_message = true;
         config.detection_policy.confirmed.actions.timeout_user = true;
         config.detection_policy.confirmed.actions.timeout_seconds = 300;
@@ -2803,6 +2805,7 @@ mod tests {
         assert_eq!(parsed.moderator_role_ids, ["5", "6"]);
         assert_eq!(parsed.scan_exempt_role_ids, ["7"]);
         assert!(!parsed.scan_policy.exempt_administrators);
+        assert!(parsed.scan_policy.mark_message_siblings_suspicious);
         assert_eq!(parsed.discord_general_log_message, "general");
         assert_eq!(parsed.discord_confirmed_log_message, "confirmed");
         assert_eq!(parsed.discord_suspicious_log_message, "suspicious");

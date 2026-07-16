@@ -11,7 +11,8 @@ use crate::{
             OcrCacheKey, SpecimenWriteLogContext, SpecimenWriteOutcome,
         },
         worker_logging::{
-            log_scan_failure, mark_message_matched, record_nonmatching_sibling_inspection,
+            log_scan_failure, mark_message_matched, mark_message_scam_confirmed,
+            record_nonmatching_sibling_inspection,
         },
         worker_preview::{
             PreviewScanContext, choose_preview_route, generate_specimen_preview_variant,
@@ -37,10 +38,10 @@ use crate::{
             source_ocr_payload,
         },
         types::{
-            CachedDecisionOutcome, ImageCandidate, ImageFingerprint, ImageFingerprintTimingSample,
-            ImageMatchStageMetric, ImageMetricEvent, ImagePerfSample, ImageScanDecisionMetric,
-            ImageStageTimingSample, MatchConfidence, MatchOutcome, TextGateResolutionMetric,
-            Xxh128,
+            CachedDecisionOutcome, FingerprintRepresentation, ImageCandidate, ImageFingerprint,
+            ImageFingerprintTimingSample, ImageMatchStageMetric, ImageMetricEvent, ImagePerfSample,
+            ImageScanDecisionMetric, ImageStageTimingSample, MatchConfidence, MatchDiagnostics,
+            MatchOutcome, MatchStepDiagnostic, TextGateResolutionMetric, Xxh128,
         },
     },
 };
@@ -525,7 +526,8 @@ fn match_stage_for_confidence(confidence: MatchConfidence) -> ImageMatchStageMet
         | MatchConfidence::ClusterCoherence
         | MatchConfidence::SuspiciousLocalAnchors
         | MatchConfidence::DenseLocalAnchors
-        | MatchConfidence::SuspiciousDenseLocalAnchors => ImageMatchStageMetric::LocalAnchors,
+        | MatchConfidence::SuspiciousDenseLocalAnchors
+        | MatchConfidence::MessageSibling => ImageMatchStageMetric::LocalAnchors,
     }
 }
 
@@ -596,7 +598,9 @@ async fn apply_detection_outcome(input: DetectionOutcomeInput) {
         return;
     }
 
-    state.record_specimen_hit(&outcome.specimen_id);
+    if !matches!(outcome.confidence, MatchConfidence::MessageSibling) {
+        state.record_specimen_hit(&outcome.specimen_id);
+    }
 
     let runtime_config = state.active_config_arc();
     let mut effective_outcome = outcome.clone();
@@ -605,7 +609,7 @@ async fn apply_detection_outcome(input: DetectionOutcomeInput) {
     if ocr_promoted_to_confirmed {
         effective_outcome.suspicious = false;
     }
-    if ocr_followup.is_none() {
+    if ocr_followup.is_none() && !matches!(outcome.confidence, MatchConfidence::MessageSibling) {
         state.hash_outcome_cache.lock().insert_match(
             state.guild_id().get(),
             internal_xxh128(&byte_xxh128),
@@ -628,6 +632,10 @@ async fn apply_detection_outcome(input: DetectionOutcomeInput) {
     } else {
         specimen_candidate
     };
+
+    if !effective_outcome.suspicious && !candidate.verify_only {
+        mark_message_scam_confirmed(&state, &candidate, &effective_outcome).await;
+    }
 
     if state.safe_mode.load(Ordering::Acquire) {
         info!(
@@ -791,7 +799,8 @@ pub(crate) async fn ocr_followup_loop(
             break;
         }
         tasks.spawn(
-            async move { run_ocr_followup(input).await }.instrument(info_span!("ocr_followup")),
+            async move { Box::pin(run_ocr_followup(input)).await }
+                .instrument(info_span!("ocr_followup")),
         );
     }
     drain_joinset_on_shutdown(
@@ -1103,20 +1112,26 @@ async fn run_ocr_followup(input: OcrFollowupInput) {
     let ocr_promoted_to_confirmed = text_gate_confirms_bad(Some(&report));
     if ocr_promoted_to_confirmed {
         final_outcome.suspicious = false;
+        if !candidate.verify_only {
+            mark_message_scam_confirmed(&state, &candidate, &final_outcome).await;
+        }
     }
 
-    if matches!(report.verdict, TextGateVerdict::Good) {
-        state
-            .hash_outcome_cache
-            .lock()
-            .insert_pass(state.guild_id().get(), xxh128, policy_hash);
-    } else {
-        state.hash_outcome_cache.lock().insert_match(
-            state.guild_id().get(),
-            xxh128,
-            policy_hash,
-            &final_outcome,
-        );
+    if !matches!(outcome.confidence, MatchConfidence::MessageSibling) {
+        if matches!(report.verdict, TextGateVerdict::Good) {
+            state.hash_outcome_cache.lock().insert_pass(
+                state.guild_id().get(),
+                xxh128,
+                policy_hash,
+            );
+        } else {
+            state.hash_outcome_cache.lock().insert_match(
+                state.guild_id().get(),
+                xxh128,
+                policy_hash,
+                &final_outcome,
+            );
+        }
     }
     state.ocr_singleflight.remove(&ocr_key);
     if let Some(guard) = processing_guard.as_mut() {
@@ -2137,7 +2152,8 @@ fn ocr_eligible_for_suspicious_outcome(outcome: &MatchOutcome) -> bool {
         MatchConfidence::SuspiciousPerceptual
         | MatchConfidence::SuspiciousLocalAnchors
         | MatchConfidence::SuspiciousDenseLocalAnchors
-        | MatchConfidence::ClusterCoherence => true,
+        | MatchConfidence::ClusterCoherence
+        | MatchConfidence::MessageSibling => true,
         MatchConfidence::ExactXxh128
         | MatchConfidence::Perceptual
         | MatchConfidence::LocalAnchors
@@ -2153,6 +2169,9 @@ fn ocr_policy_label(outcome: &MatchOutcome, progressive: &ProgressiveDecision) -
             | MatchConfidence::SuspiciousDenseLocalAnchors
             | MatchConfidence::ClusterCoherence => {
                 "requested: specimen-based suspicious match".to_owned()
+            }
+            MatchConfidence::MessageSibling => {
+                "requested: confirmed scam message sibling".to_owned()
             }
             _ => "requested".to_owned(),
         };
@@ -2318,6 +2337,10 @@ async fn process_candidate(
             &timings,
         ));
     }
+    if candidate.sibling_escalation_source.is_some() {
+        timings.preview_fallback_reason = Some("message_sibling_escalation");
+        return process_original_candidate(state, candidate, started, &timings, &snapshot).await;
+    }
     let preview =
         match choose_preview_route(candidate, &snapshot.download_config, &snapshot.match_config) {
             PreviewRoute::OriginalOnly(reason) => {
@@ -2332,6 +2355,69 @@ async fn process_candidate(
         state, candidate, started, &timings, &snapshot, preview,
     ))
     .await
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "image dimensions are intentionally reduced to f32 for diagnostic aspect ratios"
+)]
+fn message_sibling_outcome(source: &MatchOutcome, fingerprint: &ImageFingerprint) -> MatchOutcome {
+    let width = fingerprint.width;
+    let height = fingerprint.height;
+    let area = u64::from(width).saturating_mul(u64::from(height));
+    let text_grid = &fingerprint.visual.text_grid;
+    let text_grid_mean = if text_grid.is_empty() {
+        0
+    } else {
+        let sum = text_grid.iter().map(|value| u32::from(*value)).sum::<u32>();
+        u8::try_from(sum / u32::try_from(text_grid.len()).unwrap_or(1)).unwrap_or(u8::MAX)
+    };
+    MatchOutcome {
+        specimen_id: source.specimen_id.clone(),
+        confidence: MatchConfidence::MessageSibling,
+        suspicious: true,
+        match_score: None,
+        phash64_distance: None,
+        dhash64_distance: None,
+        local_anchor_hits: None,
+        local_distinct_regions: None,
+        local_average_distance: None,
+        local_geometry_model: None,
+        diagnostics: MatchDiagnostics {
+            representation: FingerprintRepresentation::Original,
+            candidate_short_edge: width.min(height),
+            candidate_area: area,
+            candidate_aspect: width as f32 / height.max(1) as f32,
+            candidate_luma_mean: fingerprint.visual.luma_mean,
+            candidate_luma_std: fingerprint.visual.luma_std,
+            candidate_text_grid_mean: text_grid_mean,
+            candidate_text_regions: text_grid.iter().filter(|value| **value > 0).count(),
+            candidate_local_hashes: fingerprint.local_hashes.len(),
+            steps: vec![MatchStepDiagnostic {
+                threshold: "message",
+                step: "confirmed_scam_sibling",
+                passed: true,
+                reason: Some("another_image_in_message_was_confirmed"),
+                specimen_id: Some(source.specimen_id.clone()),
+                candidates_considered: None,
+                phash64_distance: None,
+                dhash64_distance: None,
+                geometry_compatible: None,
+                visual_compatible: None,
+                local_anchor_hits: None,
+                local_distinct_regions: None,
+                local_average_distance: None,
+                local_layout_spread: None,
+                local_mean_residual: None,
+                local_scale: None,
+                local_angle: None,
+                local_geometry_model: None,
+                visual_shape_signals: None,
+                visual_shape_score: None,
+                match_score: None,
+            }],
+        },
+    }
 }
 
 async fn process_candidate_with_preview_precheck(
@@ -2455,6 +2541,7 @@ async fn process_original_candidate(
     let xxh128 = downloaded.byte_xxh128;
     let image_id = xxh128.short_hex();
     let byte_xxh128 = xxh128.to_string();
+    let sibling_source = candidate.sibling_escalation_source.as_deref();
 
     let exact_started = Instant::now();
     if let Some(outcome) =
@@ -2486,7 +2573,9 @@ async fn process_original_candidate(
     timings.exact_match_lookup_us = exact_started.elapsed().as_micros();
 
     let lookup_started = Instant::now();
-    let cached_outcome = {
+    let cached_outcome = if sibling_source.is_some() {
+        None
+    } else {
         let mut cache = state.hash_outcome_cache.lock();
         cache.get(state.guild_id().get(), xxh128, policy_hash)
     };
@@ -2545,7 +2634,9 @@ async fn process_original_candidate(
         }
     };
 
-    if let Some(reason) = metadata_aspect_rejection_reason(candidate, match_config) {
+    if sibling_source.is_none()
+        && let Some(reason) = metadata_aspect_rejection_reason(candidate, match_config)
+    {
         timings.preview_fallback_reason.get_or_insert(reason);
         timings.total_us = started.elapsed().as_micros();
         state
@@ -2602,10 +2693,14 @@ async fn process_original_candidate(
     };
 
     let tier1_match_started = Instant::now();
-    let tier1_policy = confirmed_tier1_policy(&guild_config.detection_policy);
-    let tier1_match = state
-        .find_match_for_policy(Arc::new(staged.fingerprint.clone()), tier1_policy)
-        .await?;
+    let tier1_match = if sibling_source.is_some() {
+        None
+    } else {
+        let tier1_policy = confirmed_tier1_policy(&guild_config.detection_policy);
+        state
+            .find_match_for_policy(Arc::new(staged.fingerprint.clone()), tier1_policy)
+            .await?
+    };
     timings.matcher_us = timings
         .matcher_us
         .saturating_add(tier1_match_started.elapsed().as_micros());
@@ -2661,19 +2756,24 @@ async fn process_original_candidate(
 
     let fingerprint = Arc::new(fingerprint);
     let matcher_started = Instant::now();
-    let match_result = match state
-        .find_match_for_policy(
-            Arc::clone(&fingerprint),
-            guild_config.detection_policy.clone(),
-        )
-        .await
-    {
-        Ok(match_result) => match_result,
-        Err(source) => {
-            return Err(source);
-        }
+    let match_result = if sibling_source.is_some() {
+        None
+    } else {
+        state
+            .find_match_for_policy(
+                Arc::clone(&fingerprint),
+                guild_config.detection_policy.clone(),
+            )
+            .await?
     };
-    let visual = VisualClassification::from_outcome(match_result);
+    let visual = match (match_result, sibling_source) {
+        (Some(outcome), _) => VisualClassification::from_outcome(Some(outcome)),
+        (None, Some(source)) => VisualClassification::KnownSuspicious(message_sibling_outcome(
+            source,
+            fingerprint.as_ref(),
+        )),
+        (None, None) => VisualClassification::NoEvidence,
+    };
     timings.matcher_us = timings
         .matcher_us
         .saturating_add(matcher_started.elapsed().as_micros());
@@ -2788,12 +2888,16 @@ async fn process_original_candidate(
         None
     };
     timings.total_us = started.elapsed().as_micros();
-    if progressive.outcome.is_none() {
+    let message_scoped = progressive
+        .outcome
+        .as_ref()
+        .is_some_and(|outcome| matches!(outcome.confidence, MatchConfidence::MessageSibling));
+    if !message_scoped && progressive.outcome.is_none() {
         state
             .hash_outcome_cache
             .lock()
             .insert_pass(state.guild_id().get(), xxh128, policy_hash);
-    } else if let Some(outcome) = progressive.outcome.as_ref() {
+    } else if !message_scoped && let Some(outcome) = progressive.outcome.as_ref() {
         state.hash_outcome_cache.lock().insert_match(
             state.guild_id().get(),
             xxh128,
@@ -3091,7 +3195,8 @@ mod tests {
         choose_preview_route, finish_preview_scan, preview_outcome_allows_early_exit,
     };
     use crate::image::types::{
-        CandidateKind, FingerprintRepresentation, MatchDiagnostics, MatchStepDiagnostic,
+        CandidateKind, FingerprintRepresentation, ImageVisualSignature, MatchDiagnostics,
+        MatchStepDiagnostic,
     };
     use twilight_model::id::Id;
 
@@ -3114,6 +3219,7 @@ mod tests {
             metadata_height: Some(2400),
             media_flags: None,
             verify_only: false,
+            sibling_escalation_source: None,
             enqueued_at: None,
         }
     }
@@ -3232,6 +3338,36 @@ mod tests {
             decision.decision.class,
             VisualCandidateClass::KnownStrong
         ));
+    }
+
+    #[test]
+    fn confirmed_message_sibling_becomes_ocr_eligible_suspicious_outcome() {
+        let source = outcome(MatchConfidence::ExactXxh128, false);
+        let fingerprint = ImageFingerprint {
+            width: 1200,
+            height: 800,
+            mime: Some("image/png".to_owned()),
+            byte_xxh128: "00".repeat(16),
+            phash64: "00".repeat(8),
+            dhash64: "00".repeat(8),
+            visual: ImageVisualSignature::default(),
+            local_anchors: Vec::new(),
+            local_hashes: Vec::new(),
+        };
+
+        let sibling = message_sibling_outcome(&source, &fingerprint);
+
+        assert!(sibling.suspicious);
+        assert!(matches!(
+            sibling.confidence,
+            MatchConfidence::MessageSibling
+        ));
+        assert_eq!(sibling.specimen_id, source.specimen_id);
+        assert!(ocr_eligible_for_suspicious_outcome(&sibling));
+        assert_eq!(
+            sibling.diagnostics.steps[0].reason,
+            Some("another_image_in_message_was_confirmed")
+        );
     }
 
     #[test]

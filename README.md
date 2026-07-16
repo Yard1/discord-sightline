@@ -162,6 +162,13 @@ Cluster coherence is treated as suspicious support by default. It can help route
 family-like local/visual evidence to OCR, but it does not skip OCR or trigger
 confirmed actions by itself.
 
+Set `scan_policy.mark_message_siblings_suspicious = true` in the per-guild
+Advanced TOML to escalate the other images in a message after any one image is
+confirmed as a scam. A hard match triggers this immediately; an OCR-backed match
+triggers it only after OCR confirms bad text. Each otherwise non-matching sibling
+is logged as suspicious and, when the text gate is enabled, sent through OCR.
+The flag defaults to `false` so existing guilds do not incur new OCR traffic.
+
 Each operating point has its own thresholds and actions. Logs are always emitted,
 and you can add pings through the editable log content. Supported timeout
 durations are 60, 300, 600, 3600, 86400, and 604800 seconds (1m, 5m, 10m, 1h, 1

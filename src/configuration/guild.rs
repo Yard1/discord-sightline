@@ -58,6 +58,10 @@ pub struct ScanPolicy {
     pub exempt_administrators: bool,
     pub allowed_extensions: Vec<String>,
     pub max_file_bytes: u64,
+    // Keep new MessagePack-compatible fields at the end of this struct. Storage uses
+    // sequence encoding, so trailing defaults can be absent from deployed records.
+    #[serde(default)]
+    pub mark_message_siblings_suspicious: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,6 +429,7 @@ impl Default for ScanPolicy {
             exempt_administrators: default_exempt_administrators(),
             allowed_extensions: vec!["jpg".to_owned()],
             max_file_bytes: 10 * 1024 * 1024,
+            mark_message_siblings_suspicious: false,
         }
     }
 }
@@ -1728,10 +1733,11 @@ pub(crate) fn text_gate_policy_summary(policy: &TextGatePolicy) -> String {
 
 pub(crate) fn scan_policy_summary(scan_policy: &ScanPolicy) -> String {
     format!(
-        "extensions=`{}`, max_file_bytes=`{}`, exempt_administrators=`{}`",
+        "extensions=`{}`, max_file_bytes=`{}`, exempt_administrators=`{}`, mark_message_siblings_suspicious=`{}`",
         scan_policy.allowed_extensions.join(","),
         scan_policy.max_file_bytes,
-        scan_policy.exempt_administrators
+        scan_policy.exempt_administrators,
+        scan_policy.mark_message_siblings_suspicious
     )
 }
 
@@ -1970,6 +1976,30 @@ mod tests {
     }
 
     #[test]
+    fn msgpack_missing_trailing_default_is_backward_compatible() {
+        #[derive(Deserialize)]
+        struct Current {
+            a: u8,
+            b: u8,
+            #[serde(default)]
+            added: bool,
+        }
+
+        #[derive(Serialize)]
+        struct Legacy {
+            a: u8,
+            b: u8,
+        }
+
+        let bytes = rmp_serde::to_vec(&Legacy { a: 1, b: 2 }).unwrap();
+        let decoded: Current = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded.a, 1);
+        assert_eq!(decoded.b, 2);
+        assert!(!decoded.added);
+    }
+
+    #[test]
     fn compact_config_storage_round_trips() {
         let config = GuildConfig::from_guild(Id::new(1), Id::new(2));
         let record = GuildConfigRecord::new(config).sign("secret").unwrap();
@@ -1993,6 +2023,22 @@ mod tests {
         assert_eq!(decoded.schema, 2);
         assert_eq!(decoded.config.guild_id, "1");
         assert_eq!(decoded.config.ledger_channel_id, "2");
+    }
+
+    #[test]
+    fn legacy_config_defaults_message_sibling_escalation_off() {
+        let config = GuildConfig::from_guild(Id::new(1), Id::new(2));
+        let mut value = toml::Value::try_from(&config).unwrap();
+        value
+            .get_mut("scan_policy")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .remove("mark_message_siblings_suspicious");
+
+        let raw = toml::to_string(&value).unwrap();
+        let decoded: GuildConfig = toml::from_str(&raw).unwrap();
+
+        assert!(!decoded.scan_policy.mark_message_siblings_suspicious);
     }
 
     #[test]

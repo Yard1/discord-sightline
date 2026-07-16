@@ -64,6 +64,7 @@ impl AppConfig {
             exempt_administrators: self.scan.exempt_administrators,
             allowed_extensions: self.scan.allowed_extensions.clone(),
             max_file_bytes: u64::try_from(self.download.max_bytes).unwrap_or(u64::MAX),
+            mark_message_siblings_suspicious: self.scan.mark_message_siblings_suspicious,
         }
     }
 }
@@ -267,6 +268,7 @@ pub struct MatchConfig {
 pub struct RuntimeScanConfig {
     pub exempt_administrators: bool,
     pub allowed_extensions: Vec<String>,
+    pub mark_message_siblings_suspicious: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,6 +342,7 @@ impl Default for RuntimeScanConfig {
         Self {
             exempt_administrators: true,
             allowed_extensions: vec!["jpg".to_owned()],
+            mark_message_siblings_suspicious: false,
         }
     }
 }
@@ -517,6 +520,7 @@ fn validate_config(config: &AppConfig) -> Result<()> {
         exempt_administrators: config.scan.exempt_administrators,
         allowed_extensions: config.scan.allowed_extensions.clone(),
         max_file_bytes: 1,
+        mark_message_siblings_suspicious: config.scan.mark_message_siblings_suspicious,
     }
     .validate()
     .context("validating scan.allowed_extensions")?;

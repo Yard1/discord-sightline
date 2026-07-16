@@ -33,6 +33,9 @@ byte_store_max_bytes = 67108864
 # Default for newly configured guilds and empty Advanced modal resets.
 # Guild admins can edit scan_policy.exempt_administrators from /config -> Advanced.
 exempt_administrators = true
+# Escalate otherwise non-matching images in a confirmed scam message to suspicious.
+# When the guild text gate is enabled, those sibling images are also sent to OCR.
+mark_message_siblings_suspicious = true
 # Default automated message scan image types for newly configured guilds.
 # Guild admins can edit scan_policy.allowed_extensions from /config -> Advanced.
 # Values are extension names without dots; jpeg is normalized to jpg.

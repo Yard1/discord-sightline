@@ -2852,6 +2852,7 @@ mod tests {
             metadata_height: Some(2400),
             media_flags: None,
             verify_only: false,
+            sibling_escalation_source: None,
             enqueued_at: None,
         }
     }
