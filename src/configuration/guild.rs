@@ -1902,18 +1902,24 @@ fn validate_text_gate_pattern(value: &str, name: &str) -> Result<()> {
 }
 
 pub(crate) fn normalize_text_gate_pattern(raw: &str) -> String {
-    raw.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                ' '
+    let mut normalized = String::with_capacity(raw.len());
+    let mut separator_pending = false;
+
+    for character in raw.chars() {
+        if character.is_alphanumeric() {
+            if separator_pending && !normalized.is_empty() {
+                normalized.push(' ');
             }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+            normalized.extend(character.to_lowercase());
+            separator_pending = false;
+        } else if !normalized.is_empty() {
+            // OCR commonly splits a phrase over lines or emits repeated spacing. Treat every
+            // run of whitespace (and punctuation, as before) as one token separator.
+            separator_pending = true;
+        }
+    }
+
+    normalized
 }
 
 pub(crate) fn normalize_text_gate_patterns(values: &[String]) -> Vec<String> {

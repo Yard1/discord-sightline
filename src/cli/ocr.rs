@@ -15,7 +15,10 @@ use crate::{
         guild::{TextGatePolicy, normalize_text_gate_pattern},
     },
     image::{
-        engine::{DirectoryArtifactSink, NoopArtifactSink, ProgressiveEngine, StaticOcrClient},
+        engine::{
+            DirectoryArtifactSink, NoopArtifactSink, OCR_SEQUENCE_MAX_EDIT_DISTANCE, OcrResponse,
+            ProgressiveEngine, StaticOcrClient, TextGateDecision, evaluate_text_gate,
+        },
         matcher,
         pipeline::{HashMode, PreparedOcrCrop, hash_image_bytes, prepare_ocr_payload_from_bytes},
         types::ExportedImageFingerprint,
@@ -26,9 +29,13 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::{
     fs,
+    io::{self, Read as _},
     path::{Path, PathBuf},
     time::Duration,
 };
+
+const CHECK_OCR_SEQUENCE_USAGE: &str =
+    "usage: discord-sightline check-ocr-sequence <sequence> [--text TEXT | --text-file PATH]";
 
 #[derive(Debug, Clone)]
 pub(super) struct InspectOptions {
@@ -41,6 +48,67 @@ pub(super) struct OcrSpaceCliReport {
     source_path: String,
     crop: OcrSpaceCliCrop,
     response: crate::ocr_space::OcrSpaceRead,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OcrSequenceCheckReport {
+    found: bool,
+    normalized_sequence: String,
+    normalized_text: String,
+    max_edit_distance: usize,
+}
+
+pub(super) fn check_ocr_sequence(
+    sequence: &str,
+    args: &[String],
+) -> Result<OcrSequenceCheckReport> {
+    let text = match args {
+        [] => {
+            let mut text = String::new();
+            io::stdin()
+                .read_to_string(&mut text)
+                .context("reading OCR text from stdin")?;
+            text
+        }
+        [option, text] if option == "--text" => text.clone(),
+        [option, path] if option == "--text-file" => {
+            fs::read_to_string(path).with_context(|| format!("reading OCR text from {path}"))?
+        }
+        _ => return Err(anyhow!(CHECK_OCR_SEQUENCE_USAGE)),
+    };
+
+    evaluate_ocr_sequence(&text, sequence)
+}
+
+fn evaluate_ocr_sequence(text: &str, sequence: &str) -> Result<OcrSequenceCheckReport> {
+    let normalized_sequence = normalize_text_gate_pattern(sequence);
+    if normalized_sequence.is_empty() {
+        return Err(anyhow!(
+            "sequence must contain at least one letter or number"
+        ));
+    }
+    let normalized_text = normalize_text_gate_pattern(text);
+    let policy = TextGatePolicy {
+        enabled: true,
+        keyword_threshold: 0,
+        keyword_max_distance: 0,
+        keywords: Vec::new(),
+        sentences: vec![normalized_sequence.clone()],
+    };
+    let report = evaluate_text_gate(
+        &policy,
+        &OcrResponse {
+            readable: !text.trim().is_empty(),
+            text: text.to_owned(),
+        },
+    );
+
+    Ok(OcrSequenceCheckReport {
+        found: report.decision == TextGateDecision::ConfirmedSentence,
+        normalized_sequence,
+        normalized_text,
+        max_edit_distance: OCR_SEQUENCE_MAX_EDIT_DISTANCE,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -485,5 +553,47 @@ fn local_text_gate_policy(options: &InspectOptions) -> TextGatePolicy {
             .map(|text| normalize_text_gate_pattern(&text))
             .into_iter()
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_checker_uses_production_whitespace_and_ocr_tolerance() {
+        let report = evaluate_ocr_sequence(
+            "Please CONNECT\r\n\tyour\u{2003}wal1et now",
+            "connect your wallet",
+        )
+        .expect("sequence check should succeed");
+
+        assert!(report.found);
+        assert_eq!(report.normalized_sequence, "connect your wallet");
+        assert_eq!(report.normalized_text, "please connect your wal1et now");
+        assert_eq!(report.max_edit_distance, OCR_SEQUENCE_MAX_EDIT_DISTANCE);
+    }
+
+    #[test]
+    fn sequence_checker_reports_a_miss() {
+        let report = evaluate_ocr_sequence("unrelated readable text", "connect your wallet")
+            .expect("sequence check should succeed");
+
+        assert!(!report.found);
+    }
+
+    #[test]
+    fn sequence_checker_preserves_cyrillic_text() {
+        let report = evaluate_ocr_sequence(
+            "деньги поступают сразу\nна баланс",
+            "ДЕНЬГИ ПОСТУПАЮТ СРАЗУ НА БАЛАНС",
+        )
+        .expect("sequence check should succeed");
+
+        assert!(report.found);
+        assert_eq!(
+            report.normalized_sequence,
+            "деньги поступают сразу на баланс"
+        );
     }
 }

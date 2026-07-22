@@ -18,6 +18,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const OCR_SEQUENCE_MAX_EDIT_DISTANCE: usize = 2;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisualCandidateClass {
@@ -513,7 +515,11 @@ pub fn evaluate_text_gate(policy: &TextGatePolicy, response: &OcrResponse) -> Te
         .filter_map(|sentence| {
             let sentence_tokens = sentence.split_whitespace().collect::<Vec<_>>();
             (!sentence_tokens.is_empty()
-                && contains_token_window(&text_tokens, &sentence_tokens, 2))
+                && contains_token_window(
+                    &text_tokens,
+                    &sentence_tokens,
+                    OCR_SEQUENCE_MAX_EDIT_DISTANCE,
+                ))
             .then_some(sentence.clone())
         })
         .collect::<Vec<_>>();
@@ -626,18 +632,21 @@ fn keyword_edit_limit(keyword: &str, configured_limit: u8) -> usize {
 }
 
 fn levenshtein_at_most(left: &str, right: &str, limit: usize) -> bool {
-    if left.len().abs_diff(right.len()) > limit {
+    let left_len = left.chars().count();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    if left_len.abs_diff(right_chars.len()) > limit {
         return false;
     }
-    let mut previous = (0..=right.len()).collect::<Vec<_>>();
-    let mut current = vec![0usize; right.len() + 1];
-    for (left_index, left_byte) in left.bytes().enumerate() {
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0usize; right_chars.len() + 1];
+    for (left_index, left_character) in left.chars().enumerate() {
         current[0] = left_index + 1;
         let mut row_min = current[0];
-        for (right_index, right_byte) in right.bytes().enumerate() {
+        for (right_index, right_character) in right_chars.iter().enumerate() {
             let insertion = current[right_index] + 1;
             let deletion = previous[right_index + 1] + 1;
-            let substitution = previous[right_index] + usize::from(left_byte != right_byte);
+            let substitution =
+                previous[right_index] + usize::from(left_character != *right_character);
             let value = insertion.min(deletion).min(substitution);
             current[right_index + 1] = value;
             row_min = row_min.min(value);
@@ -647,7 +656,7 @@ fn levenshtein_at_most(left: &str, right: &str, limit: usize) -> bool {
         }
         std::mem::swap(&mut previous, &mut current);
     }
-    previous[right.len()] <= limit
+    previous[right_chars.len()] <= limit
 }
 
 fn sanitize_artifact_name(name: &str) -> String {
@@ -702,6 +711,54 @@ mod tests {
             },
         );
         assert_eq!(report.decision, TextGateDecision::ConfirmedKeywords);
+    }
+
+    #[test]
+    fn text_gate_confirms_long_sentence_across_ocr_whitespace() {
+        let policy = TextGatePolicy {
+            enabled: true,
+            keyword_threshold: 1,
+            keyword_max_distance: 1,
+            keywords: Vec::new(),
+            sentences: vec!["verify your wallet before claiming this airdrop".to_owned()],
+        };
+
+        let report = evaluate_text_gate(
+            &policy,
+            &OcrResponse {
+                readable: true,
+                text:
+                    "Please verify\t your\r\nwallet\u{2003}before  \n\n claiming this\tairdrop now"
+                        .to_owned(),
+            },
+        );
+
+        assert!(report.sentence_hit);
+        assert_eq!(report.decision, TextGateDecision::ConfirmedSentence);
+        assert_eq!(report.verdict, TextGateVerdict::Bad);
+    }
+
+    #[test]
+    fn text_gate_confirms_cyrillic_sentence_across_line_break() {
+        let policy = TextGatePolicy {
+            enabled: true,
+            keyword_threshold: 1,
+            keyword_max_distance: 1,
+            keywords: Vec::new(),
+            sentences: vec!["деньги поступают сразу на баланс".to_owned()],
+        };
+
+        let report = evaluate_text_gate(
+            &policy,
+            &OcrResponse {
+                readable: true,
+                text: "После регистрации деньги поступают сразу\nна баланс. Играть или выводить"
+                    .to_owned(),
+            },
+        );
+
+        assert!(report.sentence_hit);
+        assert_eq!(report.decision, TextGateDecision::ConfirmedSentence);
     }
 
     #[test]

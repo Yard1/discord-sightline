@@ -20,6 +20,9 @@ use tracing_subscriber::{EnvFilter, filter::Targets, fmt, prelude::*};
 
 fn main() -> Result<()> {
     let _tracing_guard = init_tracing();
+    if cli::handle_config_free_cli()? {
+        return Ok(());
+    }
     let config = load_config().context("loading app config for runtime initialization")?;
     let (runtime, telemetry_guard) = build_traced_runtime(&config.telemetry.dial9)?;
     let dial9_shutdown_timeout =

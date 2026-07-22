@@ -354,6 +354,8 @@ cargo run --release -- compare-image-sets ./fingerprints/specimens ./fingerprint
 cargo run --release -- inspect-image ./candidate.png --fake-ocr-text "claim airdrop" --artifacts-dir ./target/sightline-inspect
 cargo run --release -- export-ocr-crops-leave-one-out ./specimens ./target/specimen-ocr-crops-leave-one-out
 cargo run --release -- ocr-space ./specimen.png
+cargo run --release -- check-ocr-sequence "connect your wallet" --text-file ./ocr-output.txt
+cat ./ocr-output.txt | cargo run --release -- check-ocr-sequence "connect your wallet"
 cargo run --release -- benchmark-images ./specimens --repeat 5 --warmup 1 --summary-only --max-preload-bytes 536870912
 cargo run --release -- benchmark-matcher ./fingerprints/specimens ./fingerprints/candidates --repeat 10 --warmup 2 --summary-only
 ```
@@ -387,6 +389,10 @@ A few notes on the main commands:
   `compare-image-sets`, optionally evaluates the text gate via `--fake-ocr-text`,
   and writes crops plus a decision report only when `--artifacts-dir` is given.
   Production never persists crops or OCR responses.
+- **`check-ocr-sequence`** checks pasted, piped, or file-based OCR.space text
+  using the production sentence matcher. It collapses whitespace and line breaks,
+  normalizes punctuation and case, and applies the same two-edit OCR tolerance.
+  Pass text with `--text`, read it from `--text-file`, or omit both to use stdin.
 - **`export-ocr-crops-leave-one-out`** writes the exact crop bytes that would be
   sent to OCR for each specimen, organized into leave-one-out folds (a `train/`
   set of all other specimens and a `test/` set for the held-out one). In

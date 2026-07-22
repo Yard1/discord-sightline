@@ -22,6 +22,27 @@ use std::{
 };
 use twilight_model::id::Id;
 
+pub fn handle_config_free_cli() -> Result<bool> {
+    let mut args = env::args().skip(1).collect::<Vec<_>>().into_iter();
+    let Some(command) = args.next() else {
+        return Ok(false);
+    };
+    if command != "check-ocr-sequence" {
+        return Ok(false);
+    }
+
+    let sequence = args.next().ok_or_else(|| {
+        anyhow!(
+            "usage: discord-sightline check-ocr-sequence <sequence> [--text TEXT | --text-file PATH]"
+        )
+    })?;
+    let args = args.collect::<Vec<_>>();
+    let report = ocr::check_ocr_sequence(&sequence, &args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    Ok(true)
+}
+
 pub async fn handle_standalone_cli(config: &AppConfig) -> Result<bool> {
     let mut args = env::args().skip(1).collect::<Vec<_>>().into_iter();
     let Some(command) = args.next() else {
