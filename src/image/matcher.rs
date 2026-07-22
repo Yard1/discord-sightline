@@ -47,6 +47,7 @@ const LOCAL_ANCHOR_CANDIDATES_PER_REFERENCE_CAP: usize = 128;
 const CLUSTER_GRAPH_BUILD_FLOOR: u32 = 1;
 const CLUSTER_GRAPH_MAX_SPECIMENS: usize = 512;
 const CLUSTER_GRAPH_MAX_PAIR_EVALUATIONS: usize = 100_000;
+const PERCEPTUAL_GROUPED_MIN_SAVINGS_DIVISOR: usize = 4;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FingerprintComparison {
@@ -304,6 +305,7 @@ struct ParsedAnchor {
 }
 
 type PerceptualHashId = u32;
+type PerceptualValueId = u32;
 const INVALID_PERCEPTUAL_HASH_ID: PerceptualHashId = PerceptualHashId::MAX;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -357,6 +359,179 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PerceptualHashKind {
+    PHash,
+    DHash,
+}
+
+impl PerceptualHashKind {
+    const fn get(self, hashes: &PerceptualHashes) -> Option<u64> {
+        match self {
+            Self::PHash => hashes.phash64,
+            Self::DHash => hashes.dhash64,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PerceptualSegmentStorage {
+    Direct(matcher_opt::FlatSegmentIndex<SpecimenId>),
+    Grouped {
+        segments: matcher_opt::FlatSegmentIndex<PerceptualValueId>,
+        hashes: Vec<u64>,
+        member_offsets: Vec<u32>,
+        members: Vec<SpecimenId>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PerceptualSegmentIndex {
+    storage: PerceptualSegmentStorage,
+}
+
+impl PerceptualSegmentIndex {
+    fn new() -> Self {
+        Self {
+            storage: PerceptualSegmentStorage::Direct(matcher_opt::FlatSegmentIndex::with_slots(
+                matcher_opt::HAMMING_FLAT_SLOTS,
+            )),
+        }
+    }
+
+    fn rebuild(
+        &mut self,
+        specimens: &[IndexedSpecimen],
+        perceptual_hashes: &[PerceptualHashes],
+        kind: PerceptualHashKind,
+    ) {
+        let mut value_ids = HashMap::default();
+        let mut hashes = Vec::new();
+        let mut member_counts = Vec::<u32>::new();
+        let mut valid_specimens = 0usize;
+
+        for specimen in specimens {
+            let Some(hash) = perceptual_hashes
+                .get(specimen.perceptual_hash_id as usize)
+                .and_then(|hashes| kind.get(hashes))
+            else {
+                continue;
+            };
+            valid_specimens += 1;
+            let value_id = *value_ids.entry(hash).or_insert_with(|| {
+                let value_id = hashes.len() as PerceptualValueId;
+                hashes.push(hash);
+                member_counts.push(0);
+                value_id
+            });
+            member_counts[value_id as usize] = member_counts[value_id as usize].saturating_add(1);
+        }
+
+        let unique_values = hashes.len();
+        let direct_bytes = valid_specimens
+            .saturating_mul(matcher_opt::HAMMING_INDEX_SEGMENTS as usize)
+            .saturating_mul(std::mem::size_of::<SpecimenId>());
+        let grouped_bytes = unique_values
+            .saturating_mul(matcher_opt::HAMMING_INDEX_SEGMENTS as usize)
+            .saturating_mul(std::mem::size_of::<PerceptualValueId>())
+            .saturating_add(unique_values.saturating_mul(std::mem::size_of::<u64>()))
+            .saturating_add(
+                unique_values
+                    .saturating_add(1)
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(valid_specimens.saturating_mul(std::mem::size_of::<SpecimenId>()));
+
+        let minimum_savings = direct_bytes / PERCEPTUAL_GROUPED_MIN_SAVINGS_DIVISOR;
+        if grouped_bytes > direct_bytes.saturating_sub(minimum_savings) {
+            let mut segments =
+                matcher_opt::FlatSegmentIndex::with_slots(matcher_opt::HAMMING_FLAT_SLOTS);
+            for (specimen_index, specimen) in specimens.iter().enumerate() {
+                let Some(hash) = perceptual_hashes
+                    .get(specimen.perceptual_hash_id as usize)
+                    .and_then(|hashes| kind.get(hashes))
+                else {
+                    continue;
+                };
+                for slot in matcher_opt::hamming_segments_flat(hash) {
+                    segments.push(slot, specimen_index as SpecimenId);
+                }
+            }
+            self.storage = PerceptualSegmentStorage::Direct(segments);
+            return;
+        }
+
+        let mut member_offsets = Vec::with_capacity(unique_values.saturating_add(1));
+        member_offsets.push(0);
+        for count in member_counts {
+            member_offsets.push(
+                member_offsets
+                    .last()
+                    .copied()
+                    .unwrap_or(0_u32)
+                    .saturating_add(count),
+            );
+        }
+        let mut members = vec![0; valid_specimens];
+        let mut cursors = member_offsets[..unique_values].to_vec();
+        for (specimen_index, specimen) in specimens.iter().enumerate() {
+            let Some(hash) = perceptual_hashes
+                .get(specimen.perceptual_hash_id as usize)
+                .and_then(|hashes| kind.get(hashes))
+            else {
+                continue;
+            };
+            let value_id = value_ids[&hash] as usize;
+            let cursor = &mut cursors[value_id];
+            members[*cursor as usize] = specimen_index as SpecimenId;
+            *cursor = cursor.saturating_add(1);
+        }
+        let mut segments =
+            matcher_opt::FlatSegmentIndex::with_slots(matcher_opt::HAMMING_FLAT_SLOTS);
+        for (value_id, &hash) in hashes.iter().enumerate() {
+            for slot in matcher_opt::hamming_segments_flat(hash) {
+                segments.push(slot, value_id as PerceptualValueId);
+            }
+        }
+        self.storage = PerceptualSegmentStorage::Grouped {
+            segments,
+            hashes,
+            member_offsets,
+            members,
+        };
+    }
+
+    const fn mode(&self) -> &'static str {
+        match self.storage {
+            PerceptualSegmentStorage::Direct(_) => "direct",
+            PerceptualSegmentStorage::Grouped { .. } => "grouped",
+        }
+    }
+
+    fn unique_values(&self) -> usize {
+        match &self.storage {
+            PerceptualSegmentStorage::Direct(_) => 0,
+            PerceptualSegmentStorage::Grouped { hashes, .. } => hashes.len(),
+        }
+    }
+
+    fn memberships(&self) -> usize {
+        match &self.storage {
+            PerceptualSegmentStorage::Direct(_) => 0,
+            PerceptualSegmentStorage::Grouped { members, .. } => members.len(),
+        }
+    }
+
+    fn bucket_stats(&self) -> BucketOccupancyStats {
+        match &self.storage {
+            PerceptualSegmentStorage::Direct(segments)
+            | PerceptualSegmentStorage::Grouped { segments, .. } => {
+                bucket_occupancy_stats(segments.slot_lens())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Matcher {
     specimens: Vec<IndexedSpecimen>,
@@ -364,10 +539,10 @@ pub struct Matcher {
     perceptual_hashes: Vec<PerceptualHashes>,
     xxh128_index: HashMap<Xxh128, usize>,
     preview_xxh128_index: HashMap<Xxh128, usize>,
-    phash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
-    dhash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
-    preview_phash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
-    preview_dhash_segment_index: matcher_opt::FlatSegmentIndex<SpecimenId>,
+    phash_segment_index: PerceptualSegmentIndex,
+    dhash_segment_index: PerceptualSegmentIndex,
+    preview_phash_segment_index: PerceptualSegmentIndex,
+    preview_dhash_segment_index: PerceptualSegmentIndex,
     anchor_segment_index: matcher_opt::FlatSegmentIndex<ReferenceId>,
     preview_anchor_segment_index: matcher_opt::FlatSegmentIndex<ReferenceId>,
     dense_local_segment_index: matcher_opt::FlatSegmentIndex<ReferenceId>,
@@ -385,8 +560,8 @@ pub struct Matcher {
 
 #[derive(Debug, Clone, Default)]
 pub struct ExactHashIndex {
-    by_xxh128: HashMap<Xxh128, Vec<Arc<ExactHashSpecimen>>>,
-    by_specimen_id: HashMap<String, Xxh128>,
+    by_xxh128: HashMap<Xxh128, Vec<ExactHashSpecimen>>,
+    by_specimen_id: HashMap<Arc<str>, Xxh128>,
 }
 
 impl ExactHashIndex {
@@ -403,9 +578,9 @@ impl ExactHashIndex {
         let Some(byte_xxh128) = Xxh128::from_hex(&record.image.byte_xxh128) else {
             return;
         };
-        let specimen = Arc::new(ExactHashSpecimen::new(record));
+        let specimen = ExactHashSpecimen::new(record);
         self.by_specimen_id
-            .insert(specimen.specimen_id.clone(), byte_xxh128);
+            .insert(Arc::clone(&specimen.specimen_id), byte_xxh128);
         self.by_xxh128
             .entry(byte_xxh128)
             .or_default()
@@ -419,7 +594,7 @@ impl ExactHashIndex {
         let Some(specimens) = self.by_xxh128.get_mut(&byte_xxh128) else {
             return false;
         };
-        specimens.retain(|specimen| specimen.specimen_id != specimen_id);
+        specimens.retain(|specimen| specimen.specimen_id.as_ref() != specimen_id);
         if specimens.is_empty() {
             self.by_xxh128.remove(&byte_xxh128);
         }
@@ -445,7 +620,7 @@ impl ExactHashIndex {
                 diagnostics.steps.push(exact_xxh128_step(
                     name,
                     true,
-                    Some(specimen.specimen_id.clone()),
+                    Some(specimen.specimen_id.to_string()),
                     Some(1),
                     None,
                 ));
@@ -458,8 +633,9 @@ impl ExactHashIndex {
 
 #[derive(Debug, Clone)]
 struct ExactHashSpecimen {
-    specimen_id: String,
-    visual: ImageVisualSignature,
+    specimen_id: Arc<str>,
+    luma_mean: u8,
+    luma_std: u8,
     text_grid_stats: TextGridStats,
     geometry: FingerprintGeometry,
 }
@@ -480,6 +656,19 @@ pub struct MatchExplanation {
 pub struct MatcherIndexStats {
     pub specimen_count: usize,
     pub preview_specimen_count: usize,
+    pub unique_perceptual_pairs: usize,
+    pub phash_index_mode: &'static str,
+    pub dhash_index_mode: &'static str,
+    pub preview_phash_index_mode: &'static str,
+    pub preview_dhash_index_mode: &'static str,
+    pub grouped_phash_values: usize,
+    pub grouped_dhash_values: usize,
+    pub grouped_preview_phash_values: usize,
+    pub grouped_preview_dhash_values: usize,
+    pub grouped_phash_memberships: usize,
+    pub grouped_dhash_memberships: usize,
+    pub grouped_preview_phash_memberships: usize,
+    pub grouped_preview_dhash_memberships: usize,
     pub phash_buckets: BucketOccupancyStats,
     pub dhash_buckets: BucketOccupancyStats,
     pub anchor_buckets: BucketOccupancyStats,
@@ -856,25 +1045,20 @@ const fn pack_u32_pair(left: u32, right: u32) -> u64 {
     ((left as u64) << 32) | right as u64
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum PerceptualHashKind {
-    PHash,
-    DHash,
-}
-
 #[derive(Default)]
 struct PerceptualCandidateCache {
     key: Option<(MatchVariant, PerceptualHashKind, u64)>,
     seen_generation: Vec<u32>,
     generation: u32,
     indices: Vec<SpecimenId>,
+    ordered: Vec<(u8, SpecimenId)>,
 }
 
 impl PerceptualCandidateCache {
     fn collect(
         &mut self,
         key: (MatchVariant, PerceptualHashKind, u64),
-        index: &matcher_opt::FlatSegmentIndex<SpecimenId>,
+        index: &PerceptualSegmentIndex,
         specimen_count: usize,
     ) {
         if self.key == Some(key) {
@@ -882,20 +1066,56 @@ impl PerceptualCandidateCache {
         }
         self.key = Some(key);
         self.indices.clear();
-        self.seen_generation.resize(specimen_count, 0);
+        self.ordered.clear();
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
             self.seen_generation.fill(0);
             self.generation = 1;
         }
-        for slot in matcher_opt::hamming_segments_flat(key.2) {
-            for &specimen_id in index.get(slot) {
-                let specimen_index = specimen_id as usize;
-                debug_assert!(specimen_index < specimen_count);
-                if self.seen_generation[specimen_index] != self.generation {
-                    self.seen_generation[specimen_index] = self.generation;
-                    self.indices.push(specimen_id);
+        match &index.storage {
+            PerceptualSegmentStorage::Direct(segments) => {
+                self.seen_generation.resize(specimen_count, 0);
+                for slot in matcher_opt::hamming_segments_flat(key.2) {
+                    for &specimen_id in segments.get(slot) {
+                        let specimen_index = specimen_id as usize;
+                        debug_assert!(specimen_index < specimen_count);
+                        if self.seen_generation[specimen_index] != self.generation {
+                            self.seen_generation[specimen_index] = self.generation;
+                            self.indices.push(specimen_id);
+                        }
+                    }
                 }
+            }
+            PerceptualSegmentStorage::Grouped {
+                segments,
+                hashes,
+                member_offsets,
+                members,
+            } => {
+                self.seen_generation.resize(hashes.len(), 0);
+                for (segment, slot) in matcher_opt::hamming_segments_flat(key.2).enumerate() {
+                    for &value_id in segments.get(slot) {
+                        let value_index = value_id as usize;
+                        debug_assert!(value_index < hashes.len());
+                        if self.seen_generation[value_index] == self.generation {
+                            continue;
+                        }
+                        self.seen_generation[value_index] = self.generation;
+                        let start = member_offsets[value_index] as usize;
+                        let end = member_offsets[value_index + 1] as usize;
+                        self.ordered.extend(
+                            members[start..end]
+                                .iter()
+                                .map(|&specimen_id| (segment as u8, specimen_id)),
+                        );
+                    }
+                }
+                // The direct index encounters candidates by the first matching segment and then
+                // by specimen insertion order. Restore that order after expanding grouped values
+                // so winner ties and diagnostics retain their established semantics.
+                self.ordered.sort_unstable();
+                self.indices
+                    .extend(self.ordered.iter().map(|(_, specimen_id)| *specimen_id));
             }
         }
     }
@@ -991,8 +1211,6 @@ impl LocalMatchStage {
 }
 
 struct SpecimenIndexWriter<'a> {
-    phash: &'a mut matcher_opt::FlatSegmentIndex<SpecimenId>,
-    dhash: &'a mut matcher_opt::FlatSegmentIndex<SpecimenId>,
     anchors: &'a mut matcher_opt::FlatSegmentIndex<ReferenceId>,
     anchor_references: &'a mut Vec<IndexedAnchorRef>,
     dense_local: &'a mut matcher_opt::FlatSegmentIndex<ReferenceId>,
@@ -1002,21 +1220,9 @@ struct SpecimenIndexWriter<'a> {
 fn index_specimen(
     specimen: &IndexedSpecimen,
     specimen_index: usize,
-    perceptual_hashes: &[PerceptualHashes],
     indexes: &mut SpecimenIndexWriter<'_>,
 ) {
     let specimen_id = specimen_index as SpecimenId;
-    let perceptual = perceptual_hashes.get(specimen.perceptual_hash_id as usize);
-    if let Some(phash64) = perceptual.and_then(|hashes| hashes.phash64) {
-        for slot in matcher_opt::hamming_segments_flat(phash64) {
-            indexes.phash.push(slot, specimen_id);
-        }
-    }
-    if let Some(dhash64) = perceptual.and_then(|hashes| hashes.dhash64) {
-        for slot in matcher_opt::hamming_segments_flat(dhash64) {
-            indexes.dhash.push(slot, specimen_id);
-        }
-    }
     for (anchor_position, anchor) in specimen.anchors.iter().enumerate() {
         let reference_id = indexes.anchor_references.len() as ReferenceId;
         indexes.anchor_references.push(IndexedAnchorRef {
@@ -1050,18 +1256,10 @@ impl Default for Matcher {
             perceptual_hashes: Vec::new(),
             xxh128_index: HashMap::default(),
             preview_xxh128_index: HashMap::default(),
-            phash_segment_index: matcher_opt::FlatSegmentIndex::with_slots(
-                matcher_opt::HAMMING_FLAT_SLOTS,
-            ),
-            dhash_segment_index: matcher_opt::FlatSegmentIndex::with_slots(
-                matcher_opt::HAMMING_FLAT_SLOTS,
-            ),
-            preview_phash_segment_index: matcher_opt::FlatSegmentIndex::with_slots(
-                matcher_opt::HAMMING_FLAT_SLOTS,
-            ),
-            preview_dhash_segment_index: matcher_opt::FlatSegmentIndex::with_slots(
-                matcher_opt::HAMMING_FLAT_SLOTS,
-            ),
+            phash_segment_index: PerceptualSegmentIndex::new(),
+            dhash_segment_index: PerceptualSegmentIndex::new(),
+            preview_phash_segment_index: PerceptualSegmentIndex::new(),
+            preview_dhash_segment_index: PerceptualSegmentIndex::new(),
             anchor_segment_index: matcher_opt::FlatSegmentIndex::with_slots(
                 matcher_opt::HAMMING_FLAT_SLOTS,
             ),
@@ -1130,16 +1328,25 @@ impl Matcher {
         MatcherIndexStats {
             specimen_count: self.specimens.len(),
             preview_specimen_count: self.preview_specimens.len(),
-            phash_buckets: bucket_occupancy_stats(self.phash_segment_index.slot_lens()),
-            dhash_buckets: bucket_occupancy_stats(self.dhash_segment_index.slot_lens()),
+            unique_perceptual_pairs: self.perceptual_hashes.len(),
+            phash_index_mode: self.phash_segment_index.mode(),
+            dhash_index_mode: self.dhash_segment_index.mode(),
+            preview_phash_index_mode: self.preview_phash_segment_index.mode(),
+            preview_dhash_index_mode: self.preview_dhash_segment_index.mode(),
+            grouped_phash_values: self.phash_segment_index.unique_values(),
+            grouped_dhash_values: self.dhash_segment_index.unique_values(),
+            grouped_preview_phash_values: self.preview_phash_segment_index.unique_values(),
+            grouped_preview_dhash_values: self.preview_dhash_segment_index.unique_values(),
+            grouped_phash_memberships: self.phash_segment_index.memberships(),
+            grouped_dhash_memberships: self.dhash_segment_index.memberships(),
+            grouped_preview_phash_memberships: self.preview_phash_segment_index.memberships(),
+            grouped_preview_dhash_memberships: self.preview_dhash_segment_index.memberships(),
+            phash_buckets: self.phash_segment_index.bucket_stats(),
+            dhash_buckets: self.dhash_segment_index.bucket_stats(),
             anchor_buckets: bucket_occupancy_stats(self.anchor_segment_index.slot_lens()),
             dense_local_buckets: bucket_occupancy_stats(self.dense_local_segment_index.slot_lens()),
-            preview_phash_buckets: bucket_occupancy_stats(
-                self.preview_phash_segment_index.slot_lens(),
-            ),
-            preview_dhash_buckets: bucket_occupancy_stats(
-                self.preview_dhash_segment_index.slot_lens(),
-            ),
+            preview_phash_buckets: self.preview_phash_segment_index.bucket_stats(),
+            preview_dhash_buckets: self.preview_dhash_segment_index.bucket_stats(),
             preview_anchor_buckets: bucket_occupancy_stats(
                 self.preview_anchor_segment_index.slot_lens(),
             ),
@@ -1185,13 +1392,9 @@ impl Matcher {
     fn rebuild_indexes(&mut self) {
         self.xxh128_index.clear();
         self.preview_xxh128_index.clear();
-        self.phash_segment_index.clear();
-        self.dhash_segment_index.clear();
         self.anchor_segment_index.clear();
         self.anchor_references.clear();
         self.preview_specimens.clear();
-        self.preview_phash_segment_index.clear();
-        self.preview_dhash_segment_index.clear();
         self.preview_anchor_segment_index.clear();
         self.preview_anchor_references.clear();
         self.dense_local_segment_index.clear();
@@ -1230,10 +1433,7 @@ impl Matcher {
             index_specimen(
                 specimen,
                 index,
-                &self.perceptual_hashes,
                 &mut SpecimenIndexWriter {
-                    phash: &mut self.phash_segment_index,
-                    dhash: &mut self.dhash_segment_index,
                     anchors: &mut self.anchor_segment_index,
                     anchor_references: &mut self.anchor_references,
                     dense_local: &mut self.dense_local_segment_index,
@@ -1261,10 +1461,7 @@ impl Matcher {
                 index_specimen(
                     &preview,
                     preview_index,
-                    &self.perceptual_hashes,
                     &mut SpecimenIndexWriter {
-                        phash: &mut self.preview_phash_segment_index,
-                        dhash: &mut self.preview_dhash_segment_index,
                         anchors: &mut self.preview_anchor_segment_index,
                         anchor_references: &mut self.preview_anchor_references,
                         dense_local: &mut self.preview_dense_local_segment_index,
@@ -1274,6 +1471,26 @@ impl Matcher {
                 self.preview_specimens.push(preview);
             }
         }
+        self.phash_segment_index.rebuild(
+            &self.specimens,
+            &self.perceptual_hashes,
+            PerceptualHashKind::PHash,
+        );
+        self.dhash_segment_index.rebuild(
+            &self.specimens,
+            &self.perceptual_hashes,
+            PerceptualHashKind::DHash,
+        );
+        self.preview_phash_segment_index.rebuild(
+            &self.preview_specimens,
+            &self.perceptual_hashes,
+            PerceptualHashKind::PHash,
+        );
+        self.preview_dhash_segment_index.rebuild(
+            &self.preview_specimens,
+            &self.perceptual_hashes,
+            PerceptualHashKind::DHash,
+        );
         self.coherence_graph = build_coherence_graph(
             &self.specimens,
             &self.perceptual_hashes,
@@ -2793,20 +3010,14 @@ impl Matcher {
             .get(specimen.perceptual_hash_id as usize)
     }
 
-    fn variant_phash_index(
-        &self,
-        variant: MatchVariant,
-    ) -> &matcher_opt::FlatSegmentIndex<SpecimenId> {
+    fn variant_phash_index(&self, variant: MatchVariant) -> &PerceptualSegmentIndex {
         match variant {
             MatchVariant::Original => &self.phash_segment_index,
             MatchVariant::DiscordPreview => &self.preview_phash_segment_index,
         }
     }
 
-    fn variant_dhash_index(
-        &self,
-        variant: MatchVariant,
-    ) -> &matcher_opt::FlatSegmentIndex<SpecimenId> {
+    fn variant_dhash_index(&self, variant: MatchVariant) -> &PerceptualSegmentIndex {
         match variant {
             MatchVariant::Original => &self.dhash_segment_index,
             MatchVariant::DiscordPreview => &self.preview_dhash_segment_index,
@@ -2919,12 +3130,13 @@ impl IndexedSpecimenParts {
 
 impl ExactHashSpecimen {
     fn new(record: &SpecimenRecord) -> Self {
-        let visual = record.image.visual.clone();
+        let visual = &record.image.visual;
         Self {
-            specimen_id: record.specimen_id.clone(),
+            specimen_id: Arc::from(record.specimen_id.as_str()),
+            luma_mean: visual.luma_mean,
+            luma_std: visual.luma_std,
             text_grid_stats: text_grid_stats(&visual.text_grid),
             geometry: FingerprintGeometry::from_dimensions(record.image.width, record.image.height),
-            visual,
         }
     }
 }
@@ -3436,7 +3648,7 @@ fn exact_hash_outcome(
     diagnostics: MatchDiagnostics,
 ) -> MatchOutcome {
     MatchOutcome {
-        specimen_id: specimen.specimen_id.clone(),
+        specimen_id: specimen.specimen_id.to_string(),
         confidence: MatchConfidence::ExactXxh128,
         suspicious,
         match_score: Some(10_000.0),
@@ -3456,8 +3668,8 @@ fn match_diagnostics_for_exact_hash_specimen(specimen: &ExactHashSpecimen) -> Ma
         candidate_short_edge: specimen.geometry.short_edge,
         candidate_area: specimen.geometry.area,
         candidate_aspect: specimen.geometry.aspect,
-        candidate_luma_mean: specimen.visual.luma_mean,
-        candidate_luma_std: specimen.visual.luma_std,
+        candidate_luma_mean: specimen.luma_mean,
+        candidate_luma_std: specimen.luma_std,
         candidate_text_grid_mean: specimen.text_grid_stats.mean,
         candidate_text_regions: specimen.text_grid_stats.regions,
         candidate_local_hashes: 0,
@@ -5002,6 +5214,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_hash_index_keeps_compact_shared_ids_and_removal_semantics() {
+        let mut first = specimen("0000000000000000", "0000000000000000");
+        first.specimen_id = "spm_exact_first".to_owned();
+        first.image.byte_xxh128 = "a".repeat(32);
+        let mut second = first.clone();
+        second.specimen_id = "spm_exact_second".to_owned();
+        let hash = Xxh128::from_hex(&first.image.byte_xxh128).expect("valid test hash");
+        let mut index = ExactHashIndex::new(&[first, second]);
+
+        let specimens = &index.by_xxh128[&hash];
+        assert_eq!(specimens.len(), 2);
+        let first_key = index
+            .by_specimen_id
+            .get_key_value("spm_exact_first")
+            .expect("first specimen id is indexed")
+            .0;
+        assert!(Arc::ptr_eq(first_key, &specimens[0].specimen_id));
+
+        assert!(index.remove_specimen("spm_exact_first"));
+        assert_eq!(index.by_xxh128[&hash].len(), 1);
+        assert_eq!(
+            index.by_xxh128[&hash][0].specimen_id.as_ref(),
+            "spm_exact_second"
+        );
+    }
+
+    #[test]
     fn anchor_buckets_store_compact_global_reference_ids() {
         let mut record = specimen("0000000000000000", "0000000000000000");
         record.anchors = vec![test_anchor(1), test_anchor(2)];
@@ -5096,7 +5335,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_perceptual_dedup_matches_hash_set_order_and_reuses_results() {
+    fn adaptive_perceptual_index_preserves_direct_candidate_order_and_reuses_results() {
         let mut index = matcher_opt::FlatSegmentIndex::with_slots(matcher_opt::HAMMING_FLAT_SLOTS);
         let hashes = (0_u64..2_000)
             .map(|value| value.wrapping_mul(0x9e37_79b9_7f4a_7c15))
@@ -5118,14 +5357,72 @@ mod tests {
             }
         }
 
+        let records = hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                let mut record = specimen(&format!("{hash:016x}"), "0000000000000000");
+                record.specimen_id = format!("spm_perceptual_{index}");
+                record
+            })
+            .collect::<Vec<_>>();
+        let matcher = Matcher::new(records);
+        assert_eq!(matcher.phash_segment_index.mode(), "direct");
+
         let key = (MatchVariant::Original, PerceptualHashKind::PHash, query);
         let mut cache = PerceptualCandidateCache::default();
-        cache.collect(key, &index, hashes.len());
+        cache.collect(key, &matcher.phash_segment_index, hashes.len());
         assert_eq!(cache.indices, expected);
 
         let generation = cache.generation;
-        cache.collect(key, &index, hashes.len());
+        cache.collect(key, &matcher.phash_segment_index, hashes.len());
         assert_eq!(cache.generation, generation);
+        assert_eq!(cache.indices, expected);
+    }
+
+    #[test]
+    fn grouped_perceptual_index_preserves_legacy_candidate_order() {
+        let hashes = (0_u64..2_000)
+            .map(|value| (value % 8).wrapping_mul(0x1111_1111_1111_1111))
+            .collect::<Vec<_>>();
+        let mut legacy = matcher_opt::FlatSegmentIndex::with_slots(matcher_opt::HAMMING_FLAT_SLOTS);
+        for (specimen_id, hash) in hashes.iter().enumerate() {
+            for slot in matcher_opt::hamming_segments_flat(*hash) {
+                legacy.push(slot, specimen_id as SpecimenId);
+            }
+        }
+        let query = 0x1234_5678_9abc_def0;
+        let mut expected_seen = HashSet::default();
+        let mut expected = Vec::new();
+        for slot in matcher_opt::hamming_segments_flat(query) {
+            for &specimen_id in legacy.get(slot) {
+                if expected_seen.insert(specimen_id) {
+                    expected.push(specimen_id);
+                }
+            }
+        }
+
+        let records = hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                let mut record = specimen(&format!("{hash:016x}"), "0000000000000000");
+                record.specimen_id = format!("spm_grouped_{index}");
+                record
+            })
+            .collect::<Vec<_>>();
+        let matcher = Matcher::new(records);
+        assert_eq!(matcher.phash_segment_index.mode(), "grouped");
+        assert_eq!(matcher.phash_segment_index.unique_values(), 8);
+        assert_eq!(matcher.phash_segment_index.memberships(), hashes.len());
+        assert_eq!(
+            matcher.phash_segment_index.bucket_stats().entry_count,
+            8 * matcher_opt::HAMMING_INDEX_SEGMENTS as usize
+        );
+
+        let key = (MatchVariant::Original, PerceptualHashKind::PHash, query);
+        let mut cache = PerceptualCandidateCache::default();
+        cache.collect(key, &matcher.phash_segment_index, hashes.len());
         assert_eq!(cache.indices, expected);
     }
 
