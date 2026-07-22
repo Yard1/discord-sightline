@@ -7,6 +7,12 @@ use crate::{
 };
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SiblingInspectionLogReason {
+    RelatedDetection,
+    AutomaticallyMarkedSuspicious,
+}
+
 pub(crate) async fn log_scan_failure(
     state: &AppState,
     candidate: &ImageCandidate,
@@ -55,7 +61,13 @@ pub(crate) async fn mark_message_matched(state: &AppState, candidate: &ImageCand
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect::<Vec<_>>();
     for (key, inspection) in siblings {
-        log_sibling_inspection_once(state, key, inspection).await;
+        log_sibling_inspection_once(
+            state,
+            key,
+            inspection,
+            SiblingInspectionLogReason::RelatedDetection,
+        )
+        .await;
     }
 }
 
@@ -85,7 +97,13 @@ pub(crate) async fn mark_message_scam_confirmed(
     for key in sibling_keys {
         if let Some((_, inspection)) = state.sibling_inspections.remove(&key) {
             let sibling = inspection.candidate.clone();
-            log_sibling_inspection_once(state, key, inspection).await;
+            log_sibling_inspection_once(
+                state,
+                key,
+                inspection,
+                SiblingInspectionLogReason::AutomaticallyMarkedSuspicious,
+            )
+            .await;
             queue_sibling_escalation(state, sibling, outcome.clone());
         }
     }
@@ -116,9 +134,6 @@ pub(crate) async fn record_nonmatching_sibling_inspection(
     state
         .sibling_inspections
         .insert(key.clone(), inspection.clone());
-    if state.matched_messages.contains(&key.scope) {
-        log_sibling_inspection_once(state, key.clone(), inspection.clone()).await;
-    }
     let source = state
         .confirmed_messages
         .get(&key.scope)
@@ -126,7 +141,22 @@ pub(crate) async fn record_nonmatching_sibling_inspection(
     if let Some(source) = source
         && let Some((_, inspection)) = state.sibling_inspections.remove(&key)
     {
+        log_sibling_inspection_once(
+            state,
+            key,
+            inspection.clone(),
+            SiblingInspectionLogReason::AutomaticallyMarkedSuspicious,
+        )
+        .await;
         queue_sibling_escalation(state, inspection.candidate, source);
+    } else if state.matched_messages.contains(&key.scope) {
+        log_sibling_inspection_once(
+            state,
+            key,
+            inspection,
+            SiblingInspectionLogReason::RelatedDetection,
+        )
+        .await;
     }
 }
 
@@ -159,6 +189,7 @@ async fn log_sibling_inspection_once(
     state: &AppState,
     key: MessageImageKey,
     inspection: MessageSiblingInspection,
+    reason: SiblingInspectionLogReason,
 ) {
     if !state.logged_sibling_inspections.insert(key) {
         return;
@@ -169,40 +200,51 @@ async fn log_sibling_inspection_once(
         inspection.candidate.channel_id,
         inspection.candidate.message_id,
     );
-    let mut event = BotLogEvent::new(
-        "Part of matched message",
-        "This image did not trip Sightline, but another image in the same Discord message did.",
-    )
-    .color(BotLogColor::Info)
-    .image_url(inspection.candidate.url.clone())
-    .field(
-        "Target user",
-        user_incident_label(&inspection.candidate),
-        false,
-    )
-    .field("Source message", message_link, false)
-    .field(
-        "Candidate image",
-        format!(
-            "`{}` of `{}`\n`{}`\n{}",
-            inspection.candidate.candidate_index,
-            inspection.candidate.candidates_in_message,
-            inspection.image_id,
-            inspection.candidate.url
-        ),
-        false,
-    )
-    .field("Scan result", format!("`{}`", inspection.decision), true)
-    .field(
-        "Processing time",
-        format!("`{}` ms", inspection.elapsed_ms),
-        true,
-    )
-    .field("Trace ID", format!("`{}`", inspection.trace_id), false);
+    let (title, description) = sibling_inspection_log_copy(reason);
+    let mut event = BotLogEvent::new(title, description)
+        .color(BotLogColor::Info)
+        .image_url(inspection.candidate.url.clone())
+        .field(
+            "Target user",
+            user_incident_label(&inspection.candidate),
+            false,
+        )
+        .field("Source message", message_link, false)
+        .field(
+            "Candidate image",
+            format!(
+                "`{}` of `{}`\n`{}`\n{}",
+                inspection.candidate.candidate_index,
+                inspection.candidate.candidates_in_message,
+                inspection.image_id,
+                inspection.candidate.url
+            ),
+            false,
+        )
+        .field("Scan result", format!("`{}`", inspection.decision), true)
+        .field(
+            "Processing time",
+            format!("`{}` ms", inspection.elapsed_ms),
+            true,
+        )
+        .field("Trace ID", format!("`{}`", inspection.trace_id), false);
     if let Some(error) = inspection.error {
         event = event.field("Error", error.chars().take(500).collect::<String>(), false);
     }
     state.post_bot_log(event).await;
+}
+
+fn sibling_inspection_log_copy(reason: SiblingInspectionLogReason) -> (&'static str, &'static str) {
+    match reason {
+        SiblingInspectionLogReason::RelatedDetection => (
+            "Related image in flagged message",
+            "This image did not independently trip Sightline, but another image in the same Discord message was flagged.",
+        ),
+        SiblingInspectionLogReason::AutomaticallyMarkedSuspicious => (
+            "Automatically marked suspicious",
+            "This image did not independently trip Sightline. Sightline automatically marked it suspicious because another image in the same Discord message was confirmed.",
+        ),
+    }
 }
 
 fn tracks_message_siblings(candidate: &ImageCandidate) -> bool {
@@ -273,5 +315,24 @@ fn prune_keys<K>(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sibling_log_copy_distinguishes_automatic_suspicious_promotion() {
+        let (related_title, related_description) =
+            sibling_inspection_log_copy(SiblingInspectionLogReason::RelatedDetection);
+        let (promoted_title, promoted_description) =
+            sibling_inspection_log_copy(SiblingInspectionLogReason::AutomaticallyMarkedSuspicious);
+
+        assert_eq!(related_title, "Related image in flagged message");
+        assert!(related_description.contains("did not independently trip"));
+        assert_eq!(promoted_title, "Automatically marked suspicious");
+        assert!(promoted_description.contains("another image"));
+        assert!(promoted_description.contains("confirmed"));
     }
 }
