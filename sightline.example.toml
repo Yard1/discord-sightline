@@ -46,7 +46,7 @@ allowed_extensions = ["jpg"]
 # value from /config.
 max_bytes = 10485760
 max_decoded_pixels = 12000000
-timeout_seconds = 2
+timeout_seconds = 5
 max_retries = 3
 retry_base_delay_ms = 150
 # Keep one HTTP/2 connection warm to each Discord image host (the attachment
