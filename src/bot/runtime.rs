@@ -1349,7 +1349,9 @@ impl BotState {
     }
 
     pub(crate) fn request_guild_load(&self, guild_id: Id<GuildMarker>) {
-        if self.cached_guild(guild_id).is_some() {
+        // A plain key probe: building a scoped `AppState` here would deep-clone
+        // the bot config for every gateway event just to answer this question.
+        if self.guilds.contains_key(&guild_id) {
             return;
         }
 
@@ -3347,7 +3349,7 @@ async fn enqueue_message_create(
         return Ok(());
     }
 
-    let guild_config = state.active_config();
+    let guild_config = state.active_config_arc();
     if should_skip_message_scan(&state, &guild_config, message) {
         return Ok(());
     }

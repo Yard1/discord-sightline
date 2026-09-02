@@ -30,6 +30,7 @@ use reqwest::{
     header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER},
 };
 use std::{
+    borrow::Cow,
     cell::RefCell,
     io::Cursor,
     net::IpAddr,
@@ -1335,12 +1336,21 @@ fn normalize_luma(image: &DynamicImage, config: &MatchConfig) -> Option<GrayImag
         config,
         PreviewDownloadMode::MatchNormalized,
     );
-    let gray = image.to_luma8();
+    let gray = luma8_from_dynamic(image);
     if resized_width == width && resized_height == height {
-        return Some(gray);
+        return Some(gray.into_owned());
     }
 
     Some(resize_luma(&gray, resized_width, resized_height))
+}
+
+/// 8-bit luma of a decoded image, borrowing it when it already is 8-bit luma
+/// instead of cloning the full-size buffer.
+fn luma8_from_dynamic(image: &DynamicImage) -> Cow<'_, GrayImage> {
+    match image {
+        DynamicImage::ImageLuma8(gray) => Cow::Borrowed(gray),
+        _ => Cow::Owned(image.to_luma8()),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2113,6 +2123,12 @@ const FAST_CIRCLE: [(i32, i32); 16] = [
     (-2, -2),
     (-1, -3),
 ];
+const FAST_CARDINALS: &[(i32, i32)] = &[
+    FAST_CIRCLE[0],
+    FAST_CIRCLE[4],
+    FAST_CIRCLE[8],
+    FAST_CIRCLE[12],
+];
 
 #[derive(Debug)]
 struct TileScorer<'a> {
@@ -2149,6 +2165,9 @@ impl<'a> TileScorer<'a> {
         let mut sum_sq = vec![0u64; len];
         let mut edges = vec![0u32; len];
         let pixels = image.as_raw();
+        // Edge flags for the current row (right and down neighbours), computed
+        // branch-free ahead of the serial prefix pass.
+        let mut edge_flags = vec![0u32; width];
 
         for y in 0..height {
             let row_start = y * width;
@@ -2156,30 +2175,42 @@ impl<'a> TileScorer<'a> {
             let row_pixels = &pixels[row_start..row_start + width];
             let below_pixels =
                 (y + 1 < height).then(|| &pixels[next_row_start..next_row_start + width]);
-            let above_start = y * stride;
-            let out_start = (y + 1) * stride;
+            edge_flags.fill(0);
+            for (flag, pair) in edge_flags.iter_mut().zip(row_pixels.windows(2)) {
+                let delta = i16::from(pair[0]) - i16::from(pair[1]);
+                *flag = u32::from(delta.unsigned_abs() > 30);
+            }
+            if let Some(below_pixels) = below_pixels {
+                for ((flag, &value), &down) in
+                    edge_flags.iter_mut().zip(row_pixels).zip(below_pixels)
+                {
+                    let delta = i16::from(value) - i16::from(down);
+                    *flag += u32::from(delta.unsigned_abs() > 30);
+                }
+            }
+
+            let above_start = y * stride + 1;
+            let out_start = (y + 1) * stride + 1;
+            let (sum_above, sum_out) = sum.split_at_mut(out_start);
+            let (sum_sq_above, sum_sq_out) = sum_sq.split_at_mut(out_start);
+            let (edges_above, edges_out) = edges.split_at_mut(out_start);
+            let sum_above = &sum_above[above_start..above_start + width];
+            let sum_sq_above = &sum_sq_above[above_start..above_start + width];
+            let edges_above = &edges_above[above_start..above_start + width];
+            let sum_out = &mut sum_out[..width];
+            let sum_sq_out = &mut sum_sq_out[..width];
+            let edges_out = &mut edges_out[..width];
             let mut row_sum = 0u32;
             let mut row_sum_sq = 0u64;
             let mut row_edges = 0u32;
             for x in 0..width {
                 let value = u32::from(row_pixels[x]);
                 row_sum += value;
-                row_sum_sq += value as u64 * value as u64;
-
-                if x + 1 < width {
-                    let right = i16::from(row_pixels[x + 1]);
-                    row_edges += ((value as i16 - right).unsigned_abs() > 30) as u32;
-                }
-                if let Some(below_pixels) = below_pixels {
-                    let down = i16::from(below_pixels[x]);
-                    row_edges += ((value as i16 - down).unsigned_abs() > 30) as u32;
-                }
-
-                let out = out_start + x + 1;
-                let above = above_start + x + 1;
-                sum[out] = sum[above] + row_sum;
-                sum_sq[out] = sum_sq[above] + row_sum_sq;
-                edges[out] = edges[above] + row_edges;
+                row_sum_sq += u64::from(value) * u64::from(value);
+                row_edges += edge_flags[x];
+                sum_out[x] = sum_above[x] + row_sum;
+                sum_sq_out[x] = sum_sq_above[x] + row_sum_sq;
+                edges_out[x] = edges_above[x] + row_edges;
             }
         }
 
@@ -2241,6 +2272,22 @@ impl<'a> TileScorer<'a> {
         let center = i16::from(self.sample_in_bounds(x, y));
         let high = center.saturating_add(FAST_THRESHOLD);
         let low = center.saturating_sub(FAST_THRESHOLD);
+
+        // Quick reject on the four cardinal circle pixels (indices 0, 4, 8, 12):
+        // any contiguous arc of FAST_MIN_ARC (9) of the 16 circle pixels contains
+        // at least two of them, so a corner needs two bright or two dark cardinals.
+        // Most scanned pixels sit on flat regions and leave after four samples.
+        let mut bright_cardinals = 0u32;
+        let mut dark_cardinals = 0u32;
+        for &(dx, dy) in FAST_CARDINALS {
+            let value = i16::from(self.sample_in_bounds(x + dx, y + dy));
+            bright_cardinals += u32::from(value >= high);
+            dark_cardinals += u32::from(value <= low);
+        }
+        if bright_cardinals < 2 && dark_cardinals < 2 {
+            return None;
+        }
+
         let mut bright_mask = 0u32;
         let mut dark_mask = 0u32;
         let mut score = 0u32;
@@ -2480,19 +2527,15 @@ impl BasicTileScore {
 }
 
 fn has_contiguous_fast_arc(mask: u32) -> bool {
+    // Doubling the 16-bit ring lets a wrap-around arc appear as a straight run.
+    // After ANDing the run with itself shifted by 1..FAST_MIN_ARC-1, a set bit at
+    // position i means bits i..i+FAST_MIN_ARC-1 were all set: a contiguous arc.
     let doubled = mask | (mask << 16);
-    let mut run = 0u32;
-    for index in 0..32 {
-        if (doubled & (1 << index)) == 0 {
-            run = 0;
-        } else {
-            run += 1;
-            if run >= FAST_MIN_ARC {
-                return true;
-            }
-        }
+    let mut run = doubled;
+    for shift in 1..FAST_MIN_ARC {
+        run &= doubled >> shift;
     }
-    false
+    run != 0
 }
 
 fn rect_sum_u64(data: &[u64], stride: usize, x: usize, y: usize, w: usize, h: usize) -> u64 {
@@ -2581,11 +2624,15 @@ fn resize_dynamic_rgb(image: &DynamicImage, width: u32, height: u32) -> DynamicI
 fn thumbnail_rgb(image: &DynamicImage, max_dimension: u32) -> RgbImage {
     let (width, height) = image.dimensions();
     let (target_width, target_height) = fit_dimensions(width, height, max_dimension, max_dimension);
-    let rgb = image.to_rgb8();
     if target_width == width && target_height == height {
-        return rgb;
+        return image.to_rgb8();
     }
-    resize_rgb(&rgb, target_width, target_height)
+    // Resize straight from an RGB8 buffer instead of copying the full-size
+    // image first; `to_rgb8` on an RGB8 image is a plain clone.
+    match image {
+        DynamicImage::ImageRgb8(rgb) => resize_rgb(rgb, target_width, target_height),
+        _ => resize_rgb(&image.to_rgb8(), target_width, target_height),
+    }
 }
 
 fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
@@ -2828,6 +2875,153 @@ mod tests {
 
         high.await.unwrap();
         low.await.unwrap();
+    }
+
+    fn reference_contiguous_fast_arc(mask: u32) -> bool {
+        let doubled = mask | (mask << 16);
+        let mut run = 0u32;
+        for index in 0..32 {
+            if (doubled & (1 << index)) == 0 {
+                run = 0;
+            } else {
+                run += 1;
+                if run >= FAST_MIN_ARC {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn contiguous_fast_arc_matches_run_counting_reference_for_every_mask() {
+        for mask in 0..=u32::from(u16::MAX) {
+            assert_eq!(
+                has_contiguous_fast_arc(mask),
+                reference_contiguous_fast_arc(mask),
+                "mask {mask:#06x}"
+            );
+        }
+    }
+
+    fn reference_fast_corner_score(scorer: &TileScorer<'_>, x: i32, y: i32) -> Option<u32> {
+        let center = i16::from(scorer.sample_in_bounds(x, y));
+        let high = center.saturating_add(FAST_THRESHOLD);
+        let low = center.saturating_sub(FAST_THRESHOLD);
+        let mut bright_mask = 0u32;
+        let mut dark_mask = 0u32;
+        let mut score = 0u32;
+        for (index, (dx, dy)) in FAST_CIRCLE.iter().enumerate() {
+            let value = i16::from(scorer.sample_in_bounds(x + dx, y + dy));
+            if value >= high {
+                bright_mask |= 1 << index;
+            } else if value <= low {
+                dark_mask |= 1 << index;
+            }
+            score = score.saturating_add(u32::from(center.abs_diff(value)));
+        }
+        (reference_contiguous_fast_arc(bright_mask) || reference_contiguous_fast_arc(dark_mask))
+            .then_some(score)
+    }
+
+    fn pseudo_random_luma(width: u32, height: u32, seed: u64) -> GrayImage {
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut pixels = vec![0u8; (width * height) as usize];
+        // Mix flat regions, edges and noise so all corner outcomes occur.
+        for y in 0..height {
+            for x in 0..width {
+                let value = next();
+                let block = ((x / 7) + (y / 5)) % 3;
+                pixels[(y * width + x) as usize] = match block {
+                    0 => (value & 0x0f) as u8 + 100,
+                    1 => (value & 0xff) as u8,
+                    _ => {
+                        if (x + y) % 9 < 4 {
+                            30
+                        } else {
+                            220
+                        }
+                    }
+                };
+            }
+        }
+        GrayImage::from_raw(width, height, pixels).unwrap()
+    }
+
+    #[test]
+    fn tile_scorer_integral_tables_match_naive_rectangle_sums() {
+        let width = 61u32;
+        let height = 47u32;
+        let image = pseudo_random_luma(width, height, 0x7777_1234_abcd_0001);
+        let scorer = TileScorer::new(&image);
+        let pixel = |x: u32, y: u32| i16::from(image.as_raw()[(y * width + x) as usize]);
+        let rects = [
+            (0, 0, width, height),
+            (0, 0, 1, 1),
+            (5, 7, 13, 9),
+            (width - 8, height - 5, 8, 5),
+            (20, 3, 1, 40),
+            (3, 20, 50, 1),
+            (17, 11, 24, 24),
+        ];
+        for (x, y, w, h) in rects {
+            let mut expected_sum = 0u32;
+            let mut expected_sum_sq = 0u64;
+            let mut expected_edges = 0u32;
+            for yy in y..y + h {
+                for xx in x..x + w {
+                    let value = pixel(xx, yy);
+                    expected_sum += u32::from(value.unsigned_abs());
+                    expected_sum_sq += u64::from(value.unsigned_abs()).pow(2);
+                    if xx + 1 < width {
+                        expected_edges +=
+                            u32::from((value - pixel(xx + 1, yy)).unsigned_abs() > 30);
+                    }
+                    if yy + 1 < height {
+                        expected_edges +=
+                            u32::from((value - pixel(xx, yy + 1)).unsigned_abs() > 30);
+                    }
+                }
+            }
+            let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+            assert_eq!(
+                rect_sum_u32(&scorer.sum, scorer.stride, x, y, w, h),
+                expected_sum
+            );
+            assert_eq!(
+                rect_sum_u64(&scorer.sum_sq, scorer.stride, x, y, w, h),
+                expected_sum_sq
+            );
+            assert_eq!(
+                rect_sum_u32(&scorer.edges, scorer.stride, x, y, w, h),
+                expected_edges
+            );
+        }
+    }
+
+    #[test]
+    fn fast_corner_quick_reject_matches_reference_scores() {
+        let image = pseudo_random_luma(96, 80, 0x1234_5678_9abc_def1);
+        let scorer = TileScorer::new(&image);
+        let mut corners = 0usize;
+        for y in FAST_RADIUS..(80 - FAST_RADIUS) {
+            for x in FAST_RADIUS..(96 - FAST_RADIUS) {
+                let expected = reference_fast_corner_score(&scorer, x, y);
+                corners += usize::from(expected.is_some());
+                assert_eq!(
+                    scorer.fast_corner_score_in_bounds(x, y),
+                    expected,
+                    "({x}, {y})"
+                );
+            }
+        }
+        assert!(corners > 0, "test image should contain corners");
     }
 
     fn preview_candidate() -> ImageCandidate {

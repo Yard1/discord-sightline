@@ -23,7 +23,7 @@ use crate::{
             ClusterScorer, CoherenceGraph, CoherenceGraphBuilder, Decision as ClusterDecision,
             HardActReason, Match as ClusterMatch, SpecimenId, Thresholds as ClusterThresholds,
         },
-        matcher_opt::{self, hamming, hex16_to_u64},
+        matcher_opt::{self, DescriptorFeatures, FeatureGate, FeatureLanes, hamming, hex16_to_u64},
         types::{
             FingerprintRepresentation, GeometryModel, ImageAnchor, ImageFingerprint,
             ImageVisualSignature, LocalImageHash, MatchConfidence, MatchDiagnostics, MatchOutcome,
@@ -33,7 +33,7 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Serialize;
-use std::{borrow::Cow, hash::Hash, sync::Arc};
+use std::{borrow::Cow, collections::hash_map::Entry, hash::Hash, sync::Arc};
 
 const DENSE_LOCAL_CANDIDATE_SCAN_CAP_PER_SCALE: usize = 512;
 const DENSE_LOCAL_MAX_BUCKET_SIZE: usize = 1024;
@@ -44,6 +44,8 @@ const ANCHOR_MAX_CANDIDATE_PAIR_BUDGET: usize = 32_768;
 const LOCAL_VERIFICATION_CANDIDATES: usize = 32;
 const LOCAL_GEOMETRY_ALTERNATES_PER_ANCHOR: usize = 3;
 const LOCAL_ANCHOR_CANDIDATES_PER_REFERENCE_CAP: usize = 128;
+/// Upper bound on recycled anchor-hit buffers retained per matcher scratch.
+const ANCHOR_HIT_BUFFER_POOL_CAP: usize = 2 * LOCAL_VERIFICATION_CANDIDATES;
 const CLUSTER_GRAPH_BUILD_FLOOR: u32 = 1;
 const CLUSTER_GRAPH_MAX_SPECIMENS: usize = 512;
 const CLUSTER_GRAPH_MAX_PAIR_EVALUATIONS: usize = 100_000;
@@ -732,6 +734,10 @@ struct MatchEvaluationCache {
     preview_anchor_hit_filter: Option<LocalFeatureFilter>,
     original_anchor_hits: HashMap<usize, Vec<AnchorHit>>,
     preview_anchor_hits: HashMap<usize, Vec<AnchorHit>>,
+    /// Hit buffers recycled from the per-specimen caches on reset.
+    anchor_hit_buffers: Vec<Vec<AnchorHit>>,
+    /// Hit buffer for lookups whose feature filter differs from the cached one.
+    uncached_anchor_hits: Vec<AnchorHit>,
     correspondences: Vec<Correspondence>,
     geometry_scratch: GeometryScratch,
     local_candidates: LocalCandidateScratch,
@@ -745,11 +751,80 @@ impl MatchEvaluationCache {
         self.preview_local_selection = None;
         self.original_anchor_hit_filter = None;
         self.preview_anchor_hit_filter = None;
-        self.original_anchor_hits.clear();
-        self.preview_anchor_hits.clear();
+        Self::recycle_anchor_hit_buffers(
+            &mut self.original_anchor_hits,
+            &mut self.anchor_hit_buffers,
+        );
+        Self::recycle_anchor_hit_buffers(
+            &mut self.preview_anchor_hits,
+            &mut self.anchor_hit_buffers,
+        );
         self.compact.evidence.clear();
         self.compact.touched_specimens.clear();
         self.compact.cluster_matches.clear();
+    }
+
+    fn recycle_anchor_hit_buffers(
+        hits: &mut HashMap<usize, Vec<AnchorHit>>,
+        buffers: &mut Vec<Vec<AnchorHit>>,
+    ) {
+        for (_, buffer) in hits.drain() {
+            if buffers.len() < ANCHOR_HIT_BUFFER_POOL_CAP {
+                buffers.push(buffer);
+            }
+        }
+    }
+}
+
+/// Per-candidate anchor-hit cache for one match variant, split out of
+/// `MatchEvaluationCache` so hits can be borrowed while the geometry scratch
+/// buffers of the same cache are mutably in use.
+struct AnchorHitCache<'a> {
+    active_filter: &'a mut Option<LocalFeatureFilter>,
+    hits: &'a mut HashMap<usize, Vec<AnchorHit>>,
+    buffers: &'a mut Vec<Vec<AnchorHit>>,
+    uncached: &'a mut Vec<AnchorHit>,
+}
+
+impl AnchorHitCache<'_> {
+    fn verified_anchor_hits(
+        &mut self,
+        specimen_index: usize,
+        specimen: &IndexedSpecimen,
+        candidate: &ParsedCandidate,
+        limits: LocalThresholds,
+    ) -> &[AnchorHit] {
+        let filter = LocalFeatureFilter::from(limits);
+        match *self.active_filter {
+            Some(existing) if existing == filter => {}
+            Some(_) => {
+                collect_verified_anchor_hits_into(
+                    &specimen.anchors,
+                    &candidate.local_hashes,
+                    &candidate.local_feature_lanes,
+                    limits,
+                    self.uncached,
+                );
+                return self.uncached;
+            }
+            None => {
+                *self.active_filter = Some(filter);
+            }
+        }
+        match self.hits.entry(specimen_index) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let mut buffer = self.buffers.pop().unwrap_or_default();
+                collect_verified_anchor_hits_into(
+                    &specimen.anchors,
+                    &candidate.local_hashes,
+                    &candidate.local_feature_lanes,
+                    limits,
+                    &mut buffer,
+                );
+                entry.insert(buffer)
+            }
+        }
     }
 }
 
@@ -2613,30 +2688,41 @@ impl Matcher {
         }
 
         let selected_count = selection.indices.len();
-        let mut matches = Vec::new();
+        let mut matches = Vec::with_capacity(selected_count);
         let mut support_matches = Vec::new();
+        let MatchEvaluationCache {
+            original_anchor_hit_filter,
+            preview_anchor_hit_filter,
+            original_anchor_hits,
+            preview_anchor_hits,
+            anchor_hit_buffers,
+            uncached_anchor_hits,
+            correspondences,
+            geometry_scratch,
+            ..
+        } = cache;
+        let (active_filter, hits) = match variant {
+            MatchVariant::Original => (original_anchor_hit_filter, original_anchor_hits),
+            MatchVariant::DiscordPreview => (preview_anchor_hit_filter, preview_anchor_hits),
+        };
+        let mut hit_cache = AnchorHitCache {
+            active_filter,
+            hits,
+            buffers: anchor_hit_buffers,
+            uncached: uncached_anchor_hits,
+        };
         for specimen_index in selection.indices {
             let Some(specimen) = self.variant_specimens(variant).get(specimen_index) else {
                 continue;
             };
-            let hits = Self::cached_verified_anchor_hits(
-                specimen_index,
-                specimen,
-                candidate,
-                limits,
-                variant,
-                cache,
-            );
-            if let Some(comparison) = verified_local_comparison(
-                &hits,
-                limits,
-                &mut cache.correspondences,
-                &mut cache.geometry_scratch,
-            ) {
+            let hits = hit_cache.verified_anchor_hits(specimen_index, specimen, candidate, limits);
+            if let Some(comparison) =
+                verified_local_comparison(hits, limits, correspondences, geometry_scratch)
+            {
                 matches.push((specimen_index, comparison));
             } else if threshold.local_unverified_support
                 && let Some(comparison) =
-                    unverified_local_support_comparison(&hits, threshold.geometry_ratio_min_margin)
+                    unverified_local_support_comparison(hits, threshold.geometry_ratio_min_margin)
             {
                 support_matches.push((specimen_index, comparison));
             }
@@ -2675,45 +2761,6 @@ impl Matcher {
             }
         }
         selection
-    }
-
-    fn cached_verified_anchor_hits(
-        specimen_index: usize,
-        specimen: &IndexedSpecimen,
-        candidate: &ParsedCandidate,
-        limits: LocalThresholds,
-        variant: MatchVariant,
-        cache: &mut MatchEvaluationCache,
-    ) -> Vec<AnchorHit> {
-        let filter = LocalFeatureFilter::from(limits);
-        let (active_filter, hits) = match variant {
-            MatchVariant::Original => (
-                &mut cache.original_anchor_hit_filter,
-                &mut cache.original_anchor_hits,
-            ),
-            MatchVariant::DiscordPreview => (
-                &mut cache.preview_anchor_hit_filter,
-                &mut cache.preview_anchor_hits,
-            ),
-        };
-        match *active_filter {
-            Some(existing) if existing == filter => {}
-            Some(_) => {
-                return collect_verified_anchor_hits(
-                    &specimen.anchors,
-                    &candidate.local_hashes,
-                    limits,
-                );
-            }
-            None => {
-                *active_filter = Some(filter);
-            }
-        }
-        hits.entry(specimen_index)
-            .or_insert_with(|| {
-                collect_verified_anchor_hits(&specimen.anchors, &candidate.local_hashes, limits)
-            })
-            .clone()
     }
 
     fn indexed_dense_local_anchor_matches(
@@ -3151,6 +3198,8 @@ struct ParsedCandidate {
     geometry: FingerprintGeometry,
     base_local_hash_count: usize,
     local_hashes: Vec<ParsedLocalHash>,
+    /// Structure-of-arrays features of `local_hashes` for the anchor scans.
+    local_feature_lanes: FeatureLanes,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3372,6 +3421,7 @@ impl ParsedCandidate {
                 .iter()
                 .filter(|hash| hash.rotation_degrees == 0)
                 .count(),
+            local_feature_lanes: FeatureLanes::default(),
             local_hashes: image
                 .local_hashes
                 .iter()
@@ -3379,6 +3429,63 @@ impl ParsedCandidate {
                 .map(|(index, hash)| ParsedLocalHash::from_local_hash(index, hash))
                 .collect(),
         }
+        .with_feature_lanes()
+    }
+
+    fn with_feature_lanes(mut self) -> Self {
+        self.local_feature_lanes = local_hash_feature_lanes(&self.local_hashes);
+        self
+    }
+}
+
+fn local_hash_features(hash: &ParsedLocalHash) -> DescriptorFeatures {
+    DescriptorFeatures {
+        luma_mean: hash.luma_mean,
+        luma_std: hash.luma_std,
+        edge_density: hash.edge_density,
+        pos_x: hash.pos_x,
+        pos_y: hash.pos_y,
+    }
+}
+
+fn anchor_features(anchor: &ParsedAnchor) -> DescriptorFeatures {
+    DescriptorFeatures {
+        luma_mean: anchor.luma_mean,
+        luma_std: anchor.luma_std,
+        edge_density: anchor.edge_density,
+        pos_x: anchor.pos_x,
+        pos_y: anchor.pos_y,
+    }
+}
+
+/// Lanes for the selected-anchor scan: only unrotated, scaled hashes take part.
+fn local_hash_feature_lanes(hashes: &[ParsedLocalHash]) -> FeatureLanes {
+    FeatureLanes::from_entries(hashes.iter().map(|hash| {
+        (
+            local_hash_features(hash),
+            hash.rotation_degrees == 0 && hash.scale_percent != 0,
+        )
+    }))
+}
+
+fn anchor_feature_gate(threshold: LocalThresholds) -> FeatureGate {
+    FeatureGate {
+        luma_mean: threshold.local_luma_candidate_max_delta,
+        luma_std: threshold.local_contrast_candidate_max_delta,
+        edge_density: threshold.local_edge_density_candidate_max_delta,
+        position: threshold.local_position_candidate_max_delta,
+        require_eligible: true,
+    }
+}
+
+/// The dense-local gate ignores position and takes every candidate hash.
+fn dense_feature_gate(threshold: LocalThresholds) -> FeatureGate {
+    FeatureGate {
+        luma_mean: threshold.local_luma_candidate_max_delta,
+        luma_std: threshold.local_contrast_candidate_max_delta,
+        edge_density: threshold.local_edge_density_candidate_max_delta,
+        position: u8::MAX,
+        require_eligible: false,
     }
 }
 
@@ -3874,6 +3981,7 @@ fn build_coherence_graph(
         return CoherenceGraph::default();
     }
     let mut builder = CoherenceGraphBuilder::new(specimens.len(), CLUSTER_GRAPH_BUILD_FLOOR);
+    let mut scratch = PairScoreScratch::new(threshold);
     let mut evaluations = 0usize;
     for left in 0..specimens.len() {
         for right in (left + 1)..specimens.len() {
@@ -3886,6 +3994,7 @@ fn build_coherence_graph(
                 &specimens[right],
                 perceptual_hashes,
                 threshold,
+                &mut scratch,
             );
             if score > 0 {
                 builder.add_edge(left as SpecimenId, right as SpecimenId, score);
@@ -3895,18 +4004,39 @@ fn build_coherence_graph(
     builder.build()
 }
 
+/// Reusable buffers for scoring specimen pairs while building a coherence graph.
+/// The local-anchor limits are loop-invariant, and the geometry scratch buffers
+/// would otherwise be reallocated for every evaluated pair.
+struct PairScoreScratch {
+    limits: LocalThresholds,
+    geometry_scratch: GeometryScratch,
+    correspondences: Vec<Correspondence>,
+}
+
+impl PairScoreScratch {
+    fn new(threshold: &DetectionThreshold) -> Self {
+        Self {
+            limits: LocalThresholds::from_detection_threshold(threshold),
+            geometry_scratch: GeometryScratch::default(),
+            correspondences: Vec::new(),
+        }
+    }
+}
+
 fn specimen_pair_coherence_score(
     left: &IndexedSpecimen,
     right: &IndexedSpecimen,
     perceptual_hashes: &[PerceptualHashes],
     threshold: &DetectionThreshold,
+    scratch: &mut PairScoreScratch,
 ) -> u32 {
-    specimen_pair_directional_score(left, right, perceptual_hashes, threshold)
+    specimen_pair_directional_score(left, right, perceptual_hashes, threshold, scratch)
         .max(specimen_pair_directional_score(
             right,
             left,
             perceptual_hashes,
             threshold,
+            scratch,
         ))
         .round()
         .clamp(0.0, 1_000.0) as u32
@@ -3917,6 +4047,7 @@ fn specimen_pair_directional_score(
     candidate: &IndexedSpecimen,
     perceptual_hashes: &[PerceptualHashes],
     threshold: &DetectionThreshold,
+    scratch: &mut PairScoreScratch,
 ) -> f32 {
     let geometry_compatible =
         fingerprint_geometry_compatible(reference.geometry, candidate.geometry, threshold);
@@ -3953,9 +4084,7 @@ fn specimen_pair_directional_score(
     }
 
     if threshold.local_anchors {
-        let limits = LocalThresholds::from_detection_threshold(threshold);
-        let mut geometry_scratch = GeometryScratch::default();
-        let mut correspondences = Vec::new();
+        let limits = scratch.limits;
         let anchor_hits = collect_verified_anchor_hits(
             &reference.anchors,
             &candidate.dense_local_anchors,
@@ -3964,8 +4093,8 @@ fn specimen_pair_directional_score(
         if let Some(local) = verified_local_comparison(
             &anchor_hits,
             limits,
-            &mut correspondences,
-            &mut geometry_scratch,
+            &mut scratch.correspondences,
+            &mut scratch.geometry_scratch,
         ) {
             score += stage_score_with_visual(
                 local_anchor_score(&local, threshold),
@@ -3982,8 +4111,8 @@ fn specimen_pair_directional_score(
         if let Some(local) = verified_local_comparison(
             &dense_hits,
             limits,
-            &mut correspondences,
-            &mut geometry_scratch,
+            &mut scratch.correspondences,
+            &mut scratch.geometry_scratch,
         ) {
             score += stage_score_with_visual(
                 local_anchor_score(&local, threshold),
@@ -4841,21 +4970,40 @@ fn collect_verified_anchor_hits(
     candidate_hashes: &[ParsedLocalHash],
     threshold: LocalThresholds,
 ) -> Vec<AnchorHit> {
-    let mut all_hits = Vec::new();
-    let mut reference_hits: Vec<ScanHit<'_>> = Vec::new();
+    let mut all_hits = Vec::with_capacity(anchors.len() * LOCAL_GEOMETRY_ALTERNATES_PER_ANCHOR);
+    let candidate_lanes = local_hash_feature_lanes(candidate_hashes);
+    collect_verified_anchor_hits_into(
+        anchors,
+        candidate_hashes,
+        &candidate_lanes,
+        threshold,
+        &mut all_hits,
+    );
+    all_hits
+}
+
+/// `candidate_lanes` must be `local_hash_feature_lanes(candidate_hashes)`; the
+/// vector gate visits exactly the hashes the scalar feature filter accepted,
+/// in index order, so the collected hits are unchanged.
+fn collect_verified_anchor_hits_into(
+    anchors: &[ParsedAnchor],
+    candidate_hashes: &[ParsedLocalHash],
+    candidate_lanes: &FeatureLanes,
+    threshold: LocalThresholds,
+    all_hits: &mut Vec<AnchorHit>,
+) {
+    all_hits.clear();
+    debug_assert_eq!(candidate_lanes.len(), candidate_hashes.len());
+    let gate = anchor_feature_gate(threshold);
+    let mut reference_hits: Vec<ScanHit<'_>> =
+        Vec::with_capacity(LOCAL_ANCHOR_CANDIDATES_PER_REFERENCE_CAP * 2 + 1);
     for anchor in anchors {
         reference_hits.clear();
-        for candidate_hash in candidate_hashes
-            .iter()
-            .filter(|candidate_hash| candidate_hash.rotation_degrees == 0)
-            .filter(|candidate_hash| local_features_compatible(anchor, candidate_hash, threshold))
-        {
-            if candidate_hash.scale_percent == 0 {
-                continue;
-            }
+        candidate_lanes.for_each_compatible(anchor_features(anchor), gate, |index| {
+            let candidate_hash = &candidate_hashes[index];
             let distance = descriptor_hamming(anchor, candidate_hash);
             if distance > anchor.max_distance {
-                continue;
+                return;
             }
             reference_hits.push(ScanHit {
                 distance,
@@ -4868,7 +5016,7 @@ fn collect_verified_anchor_hits(
                     LOCAL_ANCHOR_CANDIDATES_PER_REFERENCE_CAP,
                 );
             }
-        }
+        });
         retain_best_scan_hits(
             &mut reference_hits,
             LOCAL_ANCHOR_CANDIDATES_PER_REFERENCE_CAP,
@@ -4877,10 +5025,9 @@ fn collect_verified_anchor_hits(
             anchor,
             &mut reference_hits,
             LOCAL_GEOMETRY_ALTERNATES_PER_ANCHOR,
-            &mut all_hits,
+            all_hits,
         );
     }
-    all_hits
 }
 
 fn retain_best_scan_hits(hits: &mut Vec<ScanHit<'_>>, cap: usize) {
@@ -4904,6 +5051,35 @@ fn append_best_distinct_anchor_hits(
             .then_with(|| left.distance.cmp(&right.distance))
     });
 
+    // `second_hamming` for a hit is the best distance among hits on a different
+    // physical candidate. One pass over `hits` records the overall best distance
+    // and the best distance outside that physical id, which answers every query
+    // below without rescanning the list per selected hit.
+    let mut best: Option<(u32, u32)> = None;
+    let mut best_other_distance = u32::MAX;
+    for scan in hits.iter() {
+        match best {
+            None => best = Some((scan.distance, scan.cand.physical_id)),
+            Some((best_distance, best_id)) => {
+                if scan.distance < best_distance {
+                    if scan.cand.physical_id != best_id {
+                        best_other_distance = best_distance;
+                    }
+                    best = Some((scan.distance, scan.cand.physical_id));
+                } else if scan.cand.physical_id != best_id {
+                    best_other_distance = best_other_distance.min(scan.distance);
+                }
+            }
+        }
+    }
+    let second_hamming_for = |cand_id: u32| -> u8 {
+        let distance = match best {
+            Some((best_distance, best_id)) if best_id != cand_id => best_distance,
+            _ => best_other_distance,
+        };
+        distance.min(u32::from(u8::MAX)) as u8
+    };
+
     for scan in hits.iter() {
         let cand_id = scan.cand.physical_id;
         if selected[start_len..]
@@ -4912,12 +5088,7 @@ fn append_best_distinct_anchor_hits(
         {
             continue;
         }
-        let second_hamming = hits
-            .iter()
-            .filter(|other| other.cand.physical_id != cand_id)
-            .map(|other| other.distance.min(u32::from(u8::MAX)) as u8)
-            .min()
-            .unwrap_or(u8::MAX);
+        let second_hamming = second_hamming_for(cand_id);
         let Some(mut correspondence) = anchor_correspondence(anchor, scan.cand, scan.distance)
         else {
             continue;
@@ -4939,28 +5110,17 @@ fn collect_verified_dense_local_hits(
     candidate_hashes: &[&ParsedLocalHash],
     threshold: LocalThresholds,
 ) -> Vec<AnchorHit> {
-    dense_local_anchors
-        .iter()
-        .filter(|dense_anchor| dense_anchor.rotation_degrees == 0)
-        .filter_map(|dense_anchor| {
-            let mut best = BestScanHit::empty();
-            for candidate_hash in candidate_hashes.iter().copied().filter(|candidate_hash| {
-                dense_local_features_compatible(dense_anchor, candidate_hash, threshold)
-            }) {
-                let distance = hamming(dense_anchor.hash, candidate_hash.hash);
-                if distance > threshold.max_distance {
-                    best.observe_distance(distance, candidate_hash.physical_id);
-                    continue;
-                }
-                best.insert(ScanHit {
-                    distance,
-                    quality: dense_local_hit_quality(dense_anchor, candidate_hash, distance),
-                    cand: candidate_hash,
-                });
-            }
-            best.into_dense_local_hit(dense_anchor)
-        })
-        .collect()
+    let candidate_lanes = FeatureLanes::from_entries(
+        candidate_hashes
+            .iter()
+            .map(|candidate_hash| (local_hash_features(candidate_hash), true)),
+    );
+    collect_verified_dense_local_hits_with_lanes(
+        dense_local_anchors,
+        &candidate_lanes,
+        |index| candidate_hashes[index],
+        threshold,
+    )
 }
 
 fn collect_verified_dense_local_hits_from_slice(
@@ -4968,54 +5128,50 @@ fn collect_verified_dense_local_hits_from_slice(
     candidate_hashes: &[ParsedLocalHash],
     threshold: LocalThresholds,
 ) -> Vec<AnchorHit> {
+    let candidate_lanes = FeatureLanes::from_entries(
+        candidate_hashes
+            .iter()
+            .map(|candidate_hash| (local_hash_features(candidate_hash), true)),
+    );
+    collect_verified_dense_local_hits_with_lanes(
+        dense_local_anchors,
+        &candidate_lanes,
+        |index| &candidate_hashes[index],
+        threshold,
+    )
+}
+
+/// Dense-local scan over `candidate_lanes`, resolving lane indexes back to the
+/// candidate hashes with `candidate_at`. The lanes carry every candidate hash,
+/// so visiting them in index order reproduces the scalar scan exactly.
+fn collect_verified_dense_local_hits_with_lanes<'a>(
+    dense_local_anchors: &[ParsedLocalHash],
+    candidate_lanes: &FeatureLanes,
+    candidate_at: impl Fn(usize) -> &'a ParsedLocalHash,
+    threshold: LocalThresholds,
+) -> Vec<AnchorHit> {
+    let gate = dense_feature_gate(threshold);
     dense_local_anchors
         .iter()
         .filter(|dense_anchor| dense_anchor.rotation_degrees == 0)
         .filter_map(|dense_anchor| {
             let mut best = BestScanHit::empty();
-            for candidate_hash in candidate_hashes.iter().filter(|candidate_hash| {
-                dense_local_features_compatible(dense_anchor, candidate_hash, threshold)
-            }) {
+            candidate_lanes.for_each_compatible(local_hash_features(dense_anchor), gate, |index| {
+                let candidate_hash = candidate_at(index);
                 let distance = hamming(dense_anchor.hash, candidate_hash.hash);
                 if distance > threshold.max_distance {
                     best.observe_distance(distance, candidate_hash.physical_id);
-                    continue;
+                    return;
                 }
                 best.insert(ScanHit {
                     distance,
                     quality: dense_local_hit_quality(dense_anchor, candidate_hash, distance),
                     cand: candidate_hash,
                 });
-            }
+            });
             best.into_dense_local_hit(dense_anchor)
         })
         .collect()
-}
-
-fn local_features_compatible(
-    anchor: &ParsedAnchor,
-    candidate: &ParsedLocalHash,
-    threshold: LocalThresholds,
-) -> bool {
-    anchor.luma_mean.abs_diff(candidate.luma_mean) <= threshold.local_luma_candidate_max_delta
-        && anchor.luma_std.abs_diff(candidate.luma_std)
-            <= threshold.local_contrast_candidate_max_delta
-        && anchor.edge_density.abs_diff(candidate.edge_density)
-            <= threshold.local_edge_density_candidate_max_delta
-        && anchor.pos_x.abs_diff(candidate.pos_x) <= threshold.local_position_candidate_max_delta
-        && anchor.pos_y.abs_diff(candidate.pos_y) <= threshold.local_position_candidate_max_delta
-}
-
-fn dense_local_features_compatible(
-    dense_anchor: &ParsedLocalHash,
-    candidate: &ParsedLocalHash,
-    threshold: LocalThresholds,
-) -> bool {
-    dense_anchor.luma_mean.abs_diff(candidate.luma_mean) <= threshold.local_luma_candidate_max_delta
-        && dense_anchor.luma_std.abs_diff(candidate.luma_std)
-            <= threshold.local_contrast_candidate_max_delta
-        && dense_anchor.edge_density.abs_diff(candidate.edge_density)
-            <= threshold.local_edge_density_candidate_max_delta
 }
 
 fn dense_local_correspondence(

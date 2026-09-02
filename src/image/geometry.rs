@@ -210,9 +210,17 @@ pub struct GeoMatch {
 #[derive(Default)]
 pub struct GeometryScratch {
     correspondences: Vec<Correspondence>,
+    voter: VoterScratch,
+}
+
+/// Buffers reused across `voter_escalate` calls.
+#[derive(Default)]
+struct VoterScratch {
     translations: Vec<P>,
     preliminary: Vec<Correspondence>,
     eval: Vec<Correspondence>,
+    vote_cells: Vec<Accumulator>,
+    best_inliers: Vec<Correspondence>,
 }
 
 pub fn verify_geometry_with_scratch(
@@ -254,9 +262,7 @@ pub fn verify_geometry_with_scratch(
         cfg,
         residual_sq,
         model_residual_sq,
-        &mut scratch.translations,
-        &mut scratch.preliminary,
-        &mut scratch.eval,
+        &mut scratch.voter,
     ) {
         return Some(m);
     }
@@ -287,13 +293,14 @@ fn limit_correspondences(correspondences: &mut Vec<Correspondence>, cap: usize, 
 
     let tail_keep = cap - quality_keep;
     let tail_len = correspondences.len() - quality_keep;
-    let mut limited = Vec::with_capacity(cap);
-    limited.extend_from_slice(&correspondences[..quality_keep]);
+    // Compact in place so the caller's scratch buffer keeps its capacity. Every
+    // sampled tail index is at or beyond its destination slot (`tail_len >
+    // tail_keep`), so the forward copy never reads an already overwritten entry.
     for index in 0..tail_keep {
         let tail_index = quality_keep + (index * tail_len / tail_keep);
-        limited.push(correspondences[tail_index]);
+        correspondences[quality_keep + index] = correspondences[tail_index];
     }
-    *correspondences = limited;
+    correspondences.truncate(cap);
 }
 
 // Similarity voter seed, optional affine/homography refinement, then final refit.
@@ -302,11 +309,16 @@ fn voter_escalate(
     cfg: &GeoCfg,
     residual_sq: f32,
     model_residual_sq: f32,
-    translations: &mut Vec<P>,
-    preliminary: &mut Vec<Correspondence>,
-    eval: &mut Vec<Correspondence>,
+    scratch: &mut VoterScratch,
 ) -> Option<GeoMatch> {
-    let (scale, angle) = vote_scale_angle(correspondences, cfg)?;
+    let VoterScratch {
+        translations,
+        preliminary,
+        eval,
+        vote_cells,
+        best_inliers,
+    } = scratch;
+    let (scale, angle) = vote_scale_angle(correspondences, cfg, vote_cells)?;
     let z = (scale * angle.cos(), scale * angle.sin());
     translations.clear();
     translations.reserve(correspondences.len());
@@ -332,8 +344,11 @@ fn voter_escalate(
     if eval.len() < cfg.min_inliers.max(2) {
         return None;
     }
+    let mut best_buffer = std::mem::take(best_inliers);
+    best_buffer.clear();
+    best_buffer.extend_from_slice(eval);
     let mut best = Cand {
-        inliers: eval.clone(),
+        inliers: best_buffer,
         sumsq: sim_ss,
         model: Model::Similarity,
         h: sim_h,
@@ -375,6 +390,8 @@ fn voter_escalate(
     // Refit the winning model class on its final inliers.
     let (inliers, model, h) =
         refit_class(&best, correspondences, residual_sq, model_residual_sq, eval);
+    // Hand the candidate buffer back to the scratch for the next verification.
+    *best_inliers = best.inliers;
     if inliers.len() < cfg.min_inliers {
         return None;
     }
@@ -434,16 +451,6 @@ struct Cand {
 }
 
 // Collect inliers of a model over all correspondences (squared-residual test).
-fn evaluate(
-    h: &Mat3,
-    correspondences: &[Correspondence],
-    thr_sq: f32,
-) -> (Vec<Correspondence>, f32) {
-    let mut inliers = Vec::with_capacity(correspondences.len());
-    let sumsq = evaluate_into(h, correspondences, thr_sq, &mut inliers);
-    (inliers, sumsq)
-}
-
 fn evaluate_into(
     h: &Mat3,
     correspondences: &[Correspondence],
@@ -461,19 +468,6 @@ fn evaluate_into(
         }
     }
     sumsq
-}
-
-fn evaluate_count(h: &Mat3, correspondences: &[Correspondence], thr_sq: f32) -> (usize, f32) {
-    let mut count = 0usize;
-    let mut sumsq = 0.0f32;
-    for corr in correspondences {
-        let r = h_apply(h, corr.spec).sub(corr.cand).len2();
-        if r <= thr_sq {
-            count += 1;
-            sumsq += r;
-        }
-    }
-    (count, sumsq)
 }
 
 // Prefer more inliers, then lower total residual.
@@ -551,16 +545,17 @@ struct Accumulator {
     angle_sum: f32,
 }
 
-struct VoteGrid {
+struct VoteGrid<'a> {
     scale_min_bin: i32,
     angle_min_bin: i32,
     scale_bins: usize,
     angle_bins: usize,
-    cells: Vec<Accumulator>,
+    filled: usize,
+    cells: &'a mut Vec<Accumulator>,
 }
 
-impl VoteGrid {
-    fn new(cfg: &GeoCfg) -> Option<Self> {
+impl<'a> VoteGrid<'a> {
+    fn new(cfg: &GeoCfg, cells: &'a mut Vec<Accumulator>) -> Option<Self> {
         if !(cfg.scale_min.is_finite()
             && cfg.scale_max.is_finite()
             && cfg.log2_scale_bin.is_finite()
@@ -582,12 +577,15 @@ impl VoteGrid {
         let scale_bins = usize::try_from(scale_max_bin - scale_min_bin + 1).ok()?;
         let angle_bins = usize::try_from(angle_max_bin - angle_min_bin + 1).ok()?;
         let len = scale_bins.checked_mul(angle_bins)?;
+        cells.clear();
+        cells.resize(len, Accumulator::default());
         Some(Self {
             scale_min_bin,
             angle_min_bin,
             scale_bins,
             angle_bins,
-            cells: vec![Accumulator::default(); len],
+            filled: 0,
+            cells,
         })
     }
 
@@ -605,6 +603,9 @@ impl VoteGrid {
             return;
         };
         let entry = &mut self.cells[index];
+        if entry.count == 0 {
+            self.filled += 1;
+        }
         entry.count += 1;
         entry.log2_scale_sum += log2_scale;
         entry.angle_sum += angle;
@@ -618,7 +619,7 @@ impl VoteGrid {
     }
 
     fn is_empty(&self) -> bool {
-        self.cells.iter().all(|acc| acc.count == 0)
+        self.filled == 0
     }
 
     fn non_empty_bins(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
@@ -637,13 +638,17 @@ impl VoteGrid {
     }
 }
 
-fn vote_scale_angle(correspondences: &[Correspondence], cfg: &GeoCfg) -> Option<(f32, f32)> {
+fn vote_scale_angle(
+    correspondences: &[Correspondence],
+    cfg: &GeoCfg,
+    cells: &mut Vec<Accumulator>,
+) -> Option<(f32, f32)> {
     // Squared thresholds so the inner loop never takes a square root.
     let min_separation_sq = cfg.min_pair_separation * cfg.min_pair_separation;
     let scale_min_sq = cfg.scale_min * cfg.scale_min;
     let scale_max_sq = cfg.scale_max * cfg.scale_max;
 
-    let mut bins = VoteGrid::new(cfg)?;
+    let mut bins = VoteGrid::new(cfg, cells)?;
     for (i, corr_i) in correspondences.iter().enumerate() {
         let spec_i = corr_i.spec;
         let cand_i = corr_i.cand;
@@ -1053,17 +1058,16 @@ fn spread_and_regions(inliers: &[Correspondence]) -> (f32, usize) {
     let mut min_y = f32::MAX;
     let mut max_x = f32::MIN;
     let mut max_y = f32::MIN;
-    let mut regions = Vec::new();
     for corr in inliers {
         min_x = min_x.min(corr.cand.x);
         min_y = min_y.min(corr.cand.y);
         max_x = max_x.max(corr.cand.x);
         max_y = max_y.max(corr.cand.y);
-        if !regions.contains(&corr.region) {
-            regions.push(corr.region);
-        }
     }
-    ((max_x - min_x).min(max_y - min_y), regions.len())
+    (
+        (max_x - min_x).min(max_y - min_y),
+        distinct_regions(inliers),
+    )
 }
 
 // --- quality-ordered fallback homography search -----------------------------
@@ -1079,6 +1083,7 @@ fn prosac_homography(
     }
     let mut rng = seed_rng(corr);
     let mut best_inliers: Vec<Correspondence> = Vec::new();
+    let mut eval: Vec<Correspondence> = Vec::with_capacity(n);
     let mut best_ss = f32::MAX;
     let mut best_h: Mat3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let max_iters = cfg.prosac_max_iters.max(1) as usize;
@@ -1103,12 +1108,12 @@ fn prosac_homography(
         if !homography_ok(&h, &pts, cfg) {
             continue;
         }
-        let (count, ss) = evaluate_count(&h, corr, thr_sq);
+        let ss = evaluate_into(&h, corr, thr_sq, &mut eval);
+        let count = eval.len();
         if count > best_inliers.len() || (count == best_inliers.len() && ss < best_ss) {
-            let (inl, _) = evaluate(&h, corr, thr_sq);
             best_ss = ss;
             best_h = h;
-            best_inliers = inl;
+            std::mem::swap(&mut best_inliers, &mut eval);
             if best_inliers.len() >= strong {
                 break;
             }
@@ -1127,22 +1132,34 @@ fn prosac_homography(
     if let Some(h) = homography_lsq(&best_inliers)
         && homography_ok(&h, &best_inliers, cfg)
     {
-        let (inl, _) = evaluate(&h, corr, thr_sq);
-        if inl.len() >= best_inliers.len() {
-            return Some((inl, h));
+        evaluate_into(&h, corr, thr_sq, &mut eval);
+        if eval.len() >= best_inliers.len() {
+            return Some((eval, h));
         }
     }
     Some((best_inliers, best_h))
 }
 
+// Region ids are small in practice (an 8x8 grid), so a bitmask covers them
+// without allocating; larger ids fall back to a lazily allocated list.
 fn distinct_regions(inliers: &[Correspondence]) -> usize {
-    let mut seen: Vec<u16> = Vec::new();
+    let mut seen_mask = 0u64;
+    let mut seen_large: Vec<u16> = Vec::new();
+    let mut count = 0usize;
     for c in inliers {
-        if !seen.contains(&c.region) {
-            seen.push(c.region);
+        if let Some(bit) = 1u64.checked_shl(u32::from(c.region))
+            && c.region < 64
+        {
+            if seen_mask & bit == 0 {
+                seen_mask |= bit;
+                count += 1;
+            }
+        } else if !seen_large.contains(&c.region) {
+            seen_large.push(c.region);
+            count += 1;
         }
     }
-    seen.len()
+    count
 }
 
 struct XorShift(u64);
@@ -1384,7 +1401,7 @@ mod tests {
 
         let cfg = GeoCfg::default();
         let expected = vote_scale_angle_map_reference(&cs, &cfg).expect("map reference votes");
-        let actual = vote_scale_angle(&cs, &cfg).expect("flat grid votes");
+        let actual = vote_scale_angle(&cs, &cfg, &mut Vec::new()).expect("flat grid votes");
         assert!((actual.0 - expected.0).abs() < 1e-6);
         assert!((actual.1 - expected.1).abs() < 1e-6);
     }

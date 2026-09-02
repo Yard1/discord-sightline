@@ -2597,12 +2597,14 @@ async fn process_original_candidate(
                 timings.singleflight_wait_us = timings
                     .singleflight_wait_us
                     .saturating_add(wait_started.elapsed().as_micros());
-                if let Some(cached) =
-                    state
-                        .hash_outcome_cache
-                        .lock()
-                        .get(state.guild_id().get(), xxh128, policy_hash)
-                {
+                // Bind the lookup first so the cache guard is released before the
+                // `insert_match` below re-locks the same mutex.
+                let cached = state.hash_outcome_cache.lock().get(
+                    state.guild_id().get(),
+                    xxh128,
+                    policy_hash,
+                );
+                if let Some(cached) = cached {
                     if let Some(outcome) =
                         state.find_exact_xxh128_for_policy(xxh128, &guild_config.detection_policy)
                     {
