@@ -316,7 +316,7 @@ impl Default for DownloadConfig {
         Self {
             max_bytes: 10 * 1024 * 1024,
             max_decoded_pixels: 12_000_000,
-            timeout_seconds: 2,
+            timeout_seconds: 5,
             max_retries: 1,
             retry_base_delay_ms: 150,
             warmer_enabled: true,

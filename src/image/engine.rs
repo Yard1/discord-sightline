@@ -605,6 +605,10 @@ fn contains_token_window(text_tokens: &[&str], pattern_tokens: &[&str], limit: u
     }
 
     let pattern = pattern_tokens.join(" ");
+    // The pattern and the two DP rows are shared by every window so the fuzzy
+    // scan does not allocate per window.
+    let pattern_chars = pattern.chars().collect::<Vec<_>>();
+    let mut rows = LevenshteinRows::default();
     let mut window = String::with_capacity(pattern.len().saturating_add(8));
     text_tokens.windows(pattern_token_count).any(|tokens| {
         window.clear();
@@ -614,7 +618,7 @@ fn contains_token_window(text_tokens: &[&str], pattern_tokens: &[&str], limit: u
             }
             window.push_str(token);
         }
-        levenshtein_at_most(&window, &pattern, limit)
+        levenshtein_at_most_chars(&window, &pattern_chars, limit, &mut rows)
     })
 }
 
@@ -631,14 +635,27 @@ fn keyword_edit_limit(keyword: &str, configured_limit: u8) -> usize {
     usize::from(configured_limit).min(length_limit)
 }
 
-fn levenshtein_at_most(left: &str, right: &str, limit: usize) -> bool {
+#[derive(Default)]
+struct LevenshteinRows {
+    previous: Vec<usize>,
+    current: Vec<usize>,
+}
+
+fn levenshtein_at_most_chars(
+    left: &str,
+    right_chars: &[char],
+    limit: usize,
+    rows: &mut LevenshteinRows,
+) -> bool {
     let left_len = left.chars().count();
-    let right_chars = right.chars().collect::<Vec<_>>();
     if left_len.abs_diff(right_chars.len()) > limit {
         return false;
     }
-    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
-    let mut current = vec![0usize; right_chars.len() + 1];
+    let LevenshteinRows { previous, current } = rows;
+    previous.clear();
+    previous.extend(0..=right_chars.len());
+    current.clear();
+    current.resize(right_chars.len() + 1, 0);
     for (left_index, left_character) in left.chars().enumerate() {
         current[0] = left_index + 1;
         let mut row_min = current[0];
@@ -654,7 +671,7 @@ fn levenshtein_at_most(left: &str, right: &str, limit: usize) -> bool {
         if row_min > limit {
             return false;
         }
-        std::mem::swap(&mut previous, &mut current);
+        std::mem::swap(previous, current);
     }
     previous[right_chars.len()] <= limit
 }

@@ -133,8 +133,26 @@ const GUILD_LOAD_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 const GUILD_HEALTH_CHECK_PERIOD: Duration = Duration::from_secs(60);
 const GUILD_PERMISSION_REFRESH_TICKS: u64 = 5;
 const IMAGE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(350);
-const DISCORD_CDN_WARMER_HOST: &str = "cdn.discordapp.com";
-const DISCORD_CDN_WARMER_URL: &str = "https://cdn.discordapp.com/embed/avatars/0.png";
+/// A Discord image host whose pooled connection the warmer keeps alive.
+struct DiscordWarmerHost {
+    host: &'static str,
+    /// Cheap `HEAD` target on that host. Any response, including a 401 or 404,
+    /// completes the TLS and HTTP/2 setup that the pool then reuses.
+    url: &'static str,
+}
+
+/// Hosts real image downloads use: the attachment CDN, and the media proxy
+/// that serves the resized previews raced against the original download.
+const DISCORD_WARMER_HOSTS: [DiscordWarmerHost; 2] = [
+    DiscordWarmerHost {
+        host: "cdn.discordapp.com",
+        url: "https://cdn.discordapp.com/embed/avatars/0.png",
+    },
+    DiscordWarmerHost {
+        host: "media.discordapp.net",
+        url: "https://media.discordapp.net/embed/avatars/0.png",
+    },
+];
 const DISCORD_CDN_WARMER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -157,9 +175,10 @@ struct DownloadSingleflightCleanup {
     cell: Arc<OnceCell<SharedDownloadResult>>,
 }
 
+/// Last time real image traffic touched each entry of `DISCORD_WARMER_HOSTS`.
 #[derive(Default)]
 struct DownloadHostActivity {
-    cdn_discordapp_com_epoch_secs: AtomicU64,
+    touched_epoch_secs: [AtomicU64; DISCORD_WARMER_HOSTS.len()],
 }
 
 impl DownloadHostActivity {
@@ -167,21 +186,23 @@ impl DownloadHostActivity {
         let Ok(parsed) = Url::parse(url) else {
             return;
         };
-        if parsed
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case(DISCORD_CDN_WARMER_HOST))
+        let Some(host) = parsed.host_str() else {
+            return;
+        };
+        if let Some(index) = DISCORD_WARMER_HOSTS
+            .iter()
+            .position(|entry| entry.host.eq_ignore_ascii_case(host))
         {
-            self.touch_cdn();
+            self.touch(index);
         }
     }
 
-    fn touch_cdn(&self) {
-        self.cdn_discordapp_com_epoch_secs
-            .store(epoch_seconds(), Ordering::Relaxed);
+    fn touch(&self, index: usize) {
+        self.touched_epoch_secs[index].store(epoch_seconds(), Ordering::Relaxed);
     }
 
-    fn cdn_elapsed(&self) -> Duration {
-        let touched = self.cdn_discordapp_com_epoch_secs.load(Ordering::Relaxed);
+    fn elapsed(&self, index: usize) -> Duration {
+        let touched = self.touched_epoch_secs[index].load(Ordering::Relaxed);
         Duration::from_secs(epoch_seconds().saturating_sub(touched))
     }
 }
@@ -1112,10 +1133,14 @@ fn spawn_connection_warmer(state: &BotState) {
     });
     info!(
         event = "download.warmer_started",
-        host = DISCORD_CDN_WARMER_HOST,
+        hosts = DISCORD_WARMER_HOSTS
+            .iter()
+            .map(|entry| entry.host)
+            .collect::<Vec<_>>()
+            .join(","),
         period_ms = period.as_millis(),
         pool_idle_timeout_ms = IMAGE_POOL_IDLE_TIMEOUT.as_millis(),
-        "started Discord CDN connection warmer"
+        "started Discord image host connection warmer"
     );
 }
 
@@ -1134,18 +1159,21 @@ async fn connection_warmer_loop(
     }
 
     loop {
-        if activity.cdn_elapsed() < period {
-            debug!(
-                event = "download.warmer_skipped",
-                host = DISCORD_CDN_WARMER_HOST,
-                elapsed_ms = activity.cdn_elapsed().as_millis(),
-                period_ms = period.as_millis(),
-                "recent real download kept CDN connection warm"
-            );
-        } else {
+        for (index, target) in DISCORD_WARMER_HOSTS.iter().enumerate() {
+            let elapsed = activity.elapsed(index);
+            if elapsed < period {
+                debug!(
+                    event = "download.warmer_skipped",
+                    host = target.host,
+                    elapsed_ms = elapsed.as_millis(),
+                    period_ms = period.as_millis(),
+                    "recent real download kept connection warm"
+                );
+                continue;
+            }
             let started = Instant::now();
             let result = client
-                .head(DISCORD_CDN_WARMER_URL)
+                .head(target.url)
                 .timeout(DISCORD_CDN_WARMER_TIMEOUT)
                 .send()
                 .await;
@@ -1153,20 +1181,20 @@ async fn connection_warmer_loop(
             match result {
                 Ok(response) => debug!(
                     event = "download.warmer_tick",
-                    host = DISCORD_CDN_WARMER_HOST,
+                    host = target.host,
                     status = %response.status(),
                     elapsed_ms,
                     "connection warmer tick"
                 ),
                 Err(source) => debug!(
                     event = "download.warmer_failed",
-                    host = DISCORD_CDN_WARMER_HOST,
+                    host = target.host,
                     elapsed_ms,
                     ?source,
                     "connection warmer failed"
                 ),
             }
-            activity.touch_cdn();
+            activity.touch(index);
         }
 
         tokio::select! {
@@ -1349,7 +1377,9 @@ impl BotState {
     }
 
     pub(crate) fn request_guild_load(&self, guild_id: Id<GuildMarker>) {
-        if self.cached_guild(guild_id).is_some() {
+        // A plain key probe: building a scoped `AppState` here would deep-clone
+        // the bot config for every gateway event just to answer this question.
+        if self.guilds.contains_key(&guild_id) {
             return;
         }
 
@@ -3347,7 +3377,7 @@ async fn enqueue_message_create(
         return Ok(());
     }
 
-    let guild_config = state.active_config();
+    let guild_config = state.active_config_arc();
     if should_skip_message_scan(&state, &guild_config, message) {
         return Ok(());
     }
@@ -4144,7 +4174,7 @@ fn resolved_target_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadHostActivity, ImageMetricsCommand, performance_report_loop,
+        DISCORD_WARMER_HOSTS, DownloadHostActivity, ImageMetricsCommand, performance_report_loop,
         should_defer_modal_as_ephemeral_response, should_defer_modal_as_message_update,
         warmer_initial_delay,
     };
@@ -4187,14 +4217,30 @@ mod tests {
     }
 
     #[test]
-    fn warmer_activity_tracks_only_cdn_host() {
+    fn warmer_activity_tracks_each_discord_image_host_separately() {
         let activity = DownloadHostActivity::default();
+        let cdn = DISCORD_WARMER_HOSTS
+            .iter()
+            .position(|entry| entry.host == "cdn.discordapp.com")
+            .unwrap();
+        let media = DISCORD_WARMER_HOSTS
+            .iter()
+            .position(|entry| entry.host == "media.discordapp.net")
+            .unwrap();
+        let stale = Duration::from_secs(1_000_000);
+        assert!(activity.elapsed(cdn) > stale);
+        assert!(activity.elapsed(media) > stale);
 
-        activity.touch_url("https://media.discordapp.net/attachments/1/2/image.png");
-        assert!(activity.cdn_elapsed() > Duration::from_secs(1_000_000));
+        activity.touch_url("https://media.discordapp.net/attachments/1/2/image.png?width=8");
+        assert!(activity.elapsed(cdn) > stale);
+        assert!(activity.elapsed(media) < Duration::from_secs(2));
 
         activity.touch_url("https://cdn.discordapp.com/attachments/1/2/image.png");
-        assert!(activity.cdn_elapsed() < Duration::from_secs(2));
+        assert!(activity.elapsed(cdn) < Duration::from_secs(2));
+
+        // Untracked hosts and unparsable inputs are ignored.
+        activity.touch_url("https://images-ext-1.discordapp.net/external/a/b.png");
+        activity.touch_url("not a url");
     }
 
     #[tokio::test]

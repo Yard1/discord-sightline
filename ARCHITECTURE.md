@@ -29,12 +29,14 @@ Downloads go through a shared in-flight map keyed by canonical Discord URL,
 effective byte cap, and MIME hint. This coalesces duplicate simultaneous
 attachment downloads without changing the later exact-byte hash semantics.
 
-The image HTTP client also runs an optional Discord CDN connection warmer. It
-uses the same reqwest client as real image downloads and sends a cheap `HEAD`
-request to a permanent CDN avatar only when recent real downloads have not
-touched `cdn.discordapp.com`. Warmer requests bypass the download semaphore and
-image timing metrics; their debug log elapsed time is only a connection-pool
-health probe.
+The image HTTP client also runs an optional Discord connection warmer. It uses
+the same reqwest client as real image downloads and sends a cheap `HEAD` request
+to each image host only when recent real downloads have not touched that host:
+`cdn.discordapp.com` for attachments and `media.discordapp.net` for the resized
+previews in the race above, so a preview does not pay a cold TLS handshake
+after a quiet period. Warmer requests bypass the download semaphore and image
+timing metrics; their debug log elapsed time is only a connection-pool health
+probe.
 
 ## 2. Fingerprint construction
 

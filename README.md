@@ -75,12 +75,16 @@ timeouts, decoded pixel caps, local-anchor scan budgets, and the size of the
 global LRU cache of hash results. It also configures the OCR.space endpoint,
 including timeout, retry count, language, scaling, and orientation detection.
 
-The local `[download]` section can also enable a lightweight Discord CDN
-connection warmer. When `warmer_enabled = true`, Sightline uses the same image
-download HTTP client to send an occasional cheap `HEAD` request to a permanent
-Discord CDN avatar if real image traffic has not recently touched the CDN. The
-warmer does not consume download concurrency permits and is not counted in image
-pipeline metrics; its debug log latency is a pool warm/cold diagnostic.
+The local `[download]` section can also enable a lightweight Discord connection
+warmer. When `warmer_enabled = true`, Sightline uses the same image download
+HTTP client to send an occasional cheap `HEAD` request to each Discord image
+host it downloads from: the attachment CDN (`cdn.discordapp.com`) and the media
+proxy that serves resized previews (`media.discordapp.net`). A host is only
+warmed when real image traffic has not touched it recently; the response status
+does not matter, because completing the request keeps that host's TLS and
+HTTP/2 connection in the pool. The warmer does not consume download concurrency
+permits and is not counted in image pipeline metrics; its debug log latency is a
+pool warm/cold diagnostic.
 
 Guild admins can tune detection from inside Discord — lower the maximum scanned
 file size, adjust detection hyperparameters, and change the detection policy —
