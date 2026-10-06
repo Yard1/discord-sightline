@@ -47,7 +47,7 @@ allowed_extensions = ["jpg"]
 max_bytes = 10485760
 max_decoded_pixels = 12000000
 timeout_seconds = 5
-max_retries = 3
+max_retries = 5
 retry_base_delay_ms = 150
 # Keep one HTTP/2 connection warm to each Discord image host (the attachment
 # CDN and the media proxy that serves previews) with a cheap HEAD request when
@@ -250,8 +250,8 @@ runtime_name = "discord-sightline"
 # the documentation page.
 endpoint = "https://api.ocr.space/parse/image"
 timeout_seconds = 20
-total_timeout_seconds = 30
-max_retries = 3
+total_timeout_seconds = 60
+max_retries = 5
 retry_base_delay_ms = 750
 language = "eng"
 scale = true

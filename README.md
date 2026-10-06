@@ -185,7 +185,17 @@ When the text gate is enabled, Sightline sends a single OCR crop to OCR.space
 using `OCREngine=2` and `base64Image`. Crops are capped at 1 MB before the
 request. Transient HTTP and server errors, plus HTTP 429 rate limiting, are
 retried with backoff and `Retry-After` support, behind a dedicated OCR semaphore
-and an overall OCR deadline.
+and an overall OCR deadline that includes waiting for a concurrency slot.
+Exhausted requests report their attempt count. The default is three retries
+(four attempts), with exponential delays starting at 750 ms; a longer
+Retry-After takes precedence. Up to five retries are allowed, subject to the
+same total deadline (60 seconds by default, with a 20-second per-attempt timeout).
+
+Discord logs are delivered by a bounded background queue, with independent
+channels progressing concurrently. Ordinary log callers wait only for queue
+capacity. OCR first posts a pending log, then edits that same message when it
+finishes, so its position reflects the initial detection time. Repeated images
+share OCR work without keeping image scan workers waiting for OCR.
 
 If OCR is unavailable or can't read the text, the suspicious-image log says so.
 If OCR confirms a configured sentence or enough keywords, Sightline treats the

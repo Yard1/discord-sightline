@@ -617,8 +617,8 @@ fn validate_config(config: &AppConfig) -> Result<()> {
         "download.timeout_seconds must be at most 60"
     );
     anyhow::ensure!(
-        config.download.max_retries <= 3,
-        "download.max_retries must be at most 3"
+        config.download.max_retries <= 5,
+        "download.max_retries must be at most 5"
     );
     anyhow::ensure!(
         config.download.retry_base_delay_ms <= 5_000,
@@ -1196,6 +1196,31 @@ mod tests {
 
         config.download.warmer_period_seconds = 270;
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn five_retries_and_sixty_second_ocr_deadline_are_valid() {
+        let mut config = AppConfig::default();
+        config.download.max_retries = 5;
+        config.ocr_space.max_retries = 5;
+        config.ocr_space.total_timeout_seconds = 60;
+        validate_config(&config).unwrap();
+        config.download.max_retries = 6;
+        assert!(validate_config(&config).is_err());
+        config.download.max_retries = 5;
+        config.ocr_space.max_retries = 6;
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn example_configs_validate() {
+        for source in [
+            include_str!("../../sightline.example.toml"),
+            include_str!("../../sightline.example.tight.toml"),
+        ] {
+            let config: AppConfig = toml::from_str(source).unwrap();
+            validate_config(&config).unwrap();
+        }
     }
 
     #[test]

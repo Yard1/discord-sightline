@@ -111,6 +111,10 @@ impl TwilightDiscordEffects {
 pub(crate) struct MockDiscordEffects {
     next_message_id: AtomicU64,
     pub(crate) calls: Mutex<Vec<MockDiscordCall>>,
+    #[cfg(test)]
+    pub(crate) blocked_log_channel: Option<Id<ChannelMarker>>,
+    #[cfg(test)]
+    pub(crate) bot_log_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[allow(dead_code)]
@@ -168,6 +172,10 @@ impl MockDiscordEffects {
         Self {
             next_message_id: AtomicU64::new(1),
             calls: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            blocked_log_channel: None,
+            #[cfg(test)]
+            bot_log_gate: None,
         }
     }
 
@@ -228,6 +236,12 @@ impl DiscordEffects for MockDiscordEffects {
         log: RenderedBotLog,
     ) -> BoxFutureResult<'_, Id<MessageMarker>> {
         Box::pin(async move {
+            #[cfg(test)]
+            if self.blocked_log_channel == Some(channel_id)
+                && let Some(gate) = &self.bot_log_gate
+            {
+                let _permit = gate.acquire().await?;
+            }
             let message_id = self.next_message_id();
             self.record(MockDiscordCall::PostBotLog {
                 channel_id,

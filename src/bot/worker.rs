@@ -157,7 +157,7 @@ pub(crate) struct OcrFollowupInput {
     outcome: MatchOutcome,
     policy_hash: u64,
     followup: OcrFollowup,
-    processing_guard: Option<HashProcessingGuard>,
+    ocr_cell: Arc<tokio::sync::OnceCell<TextGateReport>>,
     log_response: Option<oneshot::Receiver<Option<BotLogRef>>>,
     hot_path_timings: CandidateStageTimings,
     trace_id: String,
@@ -750,6 +750,9 @@ async fn apply_detection_outcome(input: DetectionOutcomeInput) {
         respond_to,
     })
     .await;
+    // Singleflight for visual scanning must not occupy image workers during OCR.
+    // OCR has its own singleflight cell shared by the deferred follow-ups.
+    drop(processing_guard);
     if let (Some(ocr_followup), Some(response)) = (ocr_followup, response) {
         let input = OcrFollowupInput {
             state: ocr_state.clone(),
@@ -757,8 +760,11 @@ async fn apply_detection_outcome(input: DetectionOutcomeInput) {
             image_id: ocr_image_id,
             outcome: ocr_outcome,
             policy_hash,
+            ocr_cell: ocr_state.ocr_singleflight_cell(
+                internal_xxh128(&ocr_followup.fingerprint.byte_xxh128),
+                policy_hash,
+            ),
             followup: ocr_followup,
-            processing_guard,
             log_response: Some(response),
             hot_path_timings: timings,
             trace_id: ocr_trace_id,
@@ -1088,7 +1094,7 @@ async fn run_ocr_followup(input: OcrFollowupInput) {
         outcome,
         policy_hash,
         followup,
-        mut processing_guard,
+        ocr_cell: cell,
         log_response,
         hot_path_timings,
         trace_id,
@@ -1099,7 +1105,6 @@ async fn run_ocr_followup(input: OcrFollowupInput) {
         byte_xxh128: xxh128,
         policy_hash,
     };
-    let cell = state.ocr_singleflight_cell(xxh128, policy_hash);
     let report = cell
         .get_or_init(|| async {
             run_single_ocr_followup(&state, &candidate, &image_id, &outcome, &followup).await
@@ -1133,10 +1138,9 @@ async fn run_ocr_followup(input: OcrFollowupInput) {
             );
         }
     }
-    state.ocr_singleflight.remove(&ocr_key);
-    if let Some(guard) = processing_guard.as_mut() {
-        guard.finish();
-    }
+    state
+        .ocr_singleflight
+        .remove_if(&ocr_key, |_, current| Arc::ptr_eq(current, &cell));
     let current_policy_hash = state.detection_policy_hash();
     let current_config = state.active_config_arc();
     let policy_changed = current_policy_hash != policy_hash;
@@ -1877,33 +1881,34 @@ async fn detection_followup(input: DetectionFollowup) {
         audit
     );
     let log_channel_id = input.state.bot_log_channel_id();
-    let message_id = input
-        .state
-        .post_bot_log(
-            detection_bot_log(&DetectionLogInput {
-                candidate: &input.candidate,
-                image_id: &input.image_id,
-                outcome: &input.outcome,
-                progressive: &input.progressive,
-                timings: &input.timings,
-                message_link: &message_link,
-                specimen_link: &specimen_link,
-                actions_taken: &actions_taken,
-                elapsed: input.elapsed,
-                safe_mode: input.safe_mode,
-                ocr_promoted_to_confirmed: input.ocr_promoted_to_confirmed,
-                trace_id: &input.trace_id,
-            })
-            .text_attachment(
-                format!(
-                    "sightline-raw-{}-{}.txt",
-                    input.candidate.message_id.get(),
-                    input.image_id
-                ),
-                details,
-            ),
-        )
-        .await;
+    let event = detection_bot_log(&DetectionLogInput {
+        candidate: &input.candidate,
+        image_id: &input.image_id,
+        outcome: &input.outcome,
+        progressive: &input.progressive,
+        timings: &input.timings,
+        message_link: &message_link,
+        specimen_link: &specimen_link,
+        actions_taken: &actions_taken,
+        elapsed: input.elapsed,
+        safe_mode: input.safe_mode,
+        ocr_promoted_to_confirmed: input.ocr_promoted_to_confirmed,
+        trace_id: &input.trace_id,
+    })
+    .text_attachment(
+        format!(
+            "sightline-raw-{}-{}.txt",
+            input.candidate.message_id.get(),
+            input.image_id
+        ),
+        details,
+    );
+    let message_id = if input.respond_to.is_some() {
+        input.state.post_bot_log_with_response(event).await
+    } else {
+        input.state.post_bot_log(event).await;
+        None
+    };
     let log_ref = log_channel_id
         .zip(message_id)
         .map(|(channel_id, message_id)| BotLogRef {

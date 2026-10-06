@@ -41,6 +41,9 @@ twilight-util = { version = "0.17.0", default-features = false, features = ["per
 url = "2.5"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+[dev-dependencies]
+tokio = { version = "1.38", features = ["test-util", "net", "io-util"] }
+
 [features]
 default = ["nightly-simd"]
 nightly-simd = []

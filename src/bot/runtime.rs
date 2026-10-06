@@ -491,6 +491,7 @@ pub(crate) struct BotLogWriteRequest {
 enum BotLogWriteKind {
     Standard,
     ConfigUpdate { updated_by: Id<UserMarker> },
+    Edit { message_id: Id<MessageMarker> },
 }
 
 pub(crate) enum ImageMetricsCommand {
@@ -685,49 +686,16 @@ impl AppState {
         config.bot_log_channel_id()
     }
 
-    pub(crate) async fn post_bot_log(
+    pub(crate) async fn post_bot_log(&self, event: impl Into<BotLogEvent>) {
+        self.enqueue_bot_log(event.into(), None).await;
+    }
+
+    pub(crate) async fn post_bot_log_with_response(
         &self,
         event: impl Into<BotLogEvent>,
     ) -> Option<Id<MessageMarker>> {
-        let channel_id = self.bot_log_channel_id()?;
-        let event = event.into();
-        let copy_kind = event.copy_kind;
-        let mut log = render_bot_log(event);
-        stamp_bot_start_id(&mut log, &self.bot.bot_start_id);
-        let config = self.guild_config.load_full();
-        log.content = match copy_kind {
-            crate::bot::discord::BotLogCopyKind::General => {
-                config.discord_general_log_message_content()
-            }
-            crate::bot::discord::BotLogCopyKind::ConfirmedDetection => {
-                config.discord_confirmed_log_message_content()
-            }
-            crate::bot::discord::BotLogCopyKind::SuspiciousDetection => {
-                config.discord_suspicious_log_message_content()
-            }
-            crate::bot::discord::BotLogCopyKind::BenignDetection => {
-                config.discord_benign_log_message_content()
-            }
-        };
         let (respond_to, response) = oneshot::channel();
-        if let Err(source) = self
-            .bot
-            .bot_log_tx
-            .send(BotLogWriteRequest {
-                channel_id,
-                log,
-                kind: BotLogWriteKind::Standard,
-                respond_to: Some(respond_to),
-            })
-            .await
-        {
-            warn!(
-                event = "bot_log.enqueue_failed",
-                ?source,
-                "failed to enqueue bot log"
-            );
-            return None;
-        }
+        self.enqueue_bot_log(event.into(), Some(respond_to)).await?;
         match response.await {
             Ok(Ok(message_id)) => Some(message_id),
             Ok(Err(source)) => {
@@ -747,6 +715,51 @@ impl AppState {
                 None
             }
         }
+    }
+
+    async fn enqueue_bot_log(
+        &self,
+        event: BotLogEvent,
+        respond_to: Option<oneshot::Sender<Result<Id<MessageMarker>>>>,
+    ) -> Option<()> {
+        let channel_id = self.bot_log_channel_id()?;
+        let copy_kind = event.copy_kind;
+        let mut log = render_bot_log(event);
+        stamp_bot_start_id(&mut log, &self.bot.bot_start_id);
+        let config = self.guild_config.load_full();
+        log.content = match copy_kind {
+            crate::bot::discord::BotLogCopyKind::General => {
+                config.discord_general_log_message_content()
+            }
+            crate::bot::discord::BotLogCopyKind::ConfirmedDetection => {
+                config.discord_confirmed_log_message_content()
+            }
+            crate::bot::discord::BotLogCopyKind::SuspiciousDetection => {
+                config.discord_suspicious_log_message_content()
+            }
+            crate::bot::discord::BotLogCopyKind::BenignDetection => {
+                config.discord_benign_log_message_content()
+            }
+        };
+        if let Err(source) = self
+            .bot
+            .bot_log_tx
+            .send(BotLogWriteRequest {
+                channel_id,
+                log,
+                kind: BotLogWriteKind::Standard,
+                respond_to,
+            })
+            .await
+        {
+            warn!(
+                event = "bot_log.enqueue_failed",
+                ?source,
+                "failed to enqueue bot log"
+            );
+            return None;
+        }
+        Some(())
     }
 
     pub(crate) async fn edit_bot_log(
@@ -775,16 +788,22 @@ impl AppState {
             }
         };
         if let Err(source) = self
-            .discord_effects
-            .edit_bot_log_in_channel(channel_id, message_id, log)
+            .bot
+            .bot_log_tx
+            .send(BotLogWriteRequest {
+                channel_id,
+                log,
+                kind: BotLogWriteKind::Edit { message_id },
+                respond_to: None,
+            })
             .await
         {
             warn!(
-                event = "bot_log.edit_failed",
+                event = "bot_log.enqueue_failed",
                 channel_id = channel_id.get(),
                 message_id = message_id.get(),
                 ?source,
-                "failed to edit bot log"
+                "failed to enqueue bot log edit"
             );
         }
     }
@@ -2337,61 +2356,111 @@ fn detection_policy_summary(policy: &crate::configuration::guild::DetectionPolic
     )
 }
 
+const BOT_LOG_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const BOT_LOG_WRITE_CONCURRENCY: usize = 16;
+
 async fn bot_log_writer_loop(
     discord: Arc<dyn DiscordEffects>,
     mut rx: mpsc::Receiver<BotLogWriteRequest>,
 ) {
     let mut last_config_logs =
         HashMap::<Id<ChannelMarker>, (Id<UserMarker>, Id<MessageMarker>)>::new();
+    let mut pending = std::collections::VecDeque::<BotLogWriteRequest>::new();
+    let mut active_channels = HashSet::new();
+    let mut writes = futures_util::stream::FuturesUnordered::new();
+    let pending_limit = rx.max_capacity();
+    let mut closed = false;
 
-    while let Some(request) = rx.recv().await {
-        let channel_id = request.channel_id;
-        let result = match request.kind {
-            BotLogWriteKind::ConfigUpdate { updated_by }
-                if request.respond_to.is_none()
-                    && last_config_logs
-                        .get(&channel_id)
-                        .is_some_and(|(last_user, _)| *last_user == updated_by) =>
-            {
-                let (_, message_id) = last_config_logs[&channel_id];
-                discord
-                    .edit_bot_log_in_channel(request.channel_id, message_id, request.log)
-                    .await
-                    .map(|()| message_id)
-            }
-            _ => {
-                let result = discord
-                    .post_bot_log_to_channel(request.channel_id, request.log)
-                    .await;
-                if let Ok(message_id) = result {
-                    match request.kind {
-                        BotLogWriteKind::ConfigUpdate { updated_by }
-                            if request.respond_to.is_none() =>
-                        {
-                            last_config_logs.insert(channel_id, (updated_by, message_id));
-                        }
-                        _ => {
-                            last_config_logs.remove(&channel_id);
-                        }
-                    }
+    loop {
+        while writes.len() < BOT_LOG_WRITE_CONCURRENCY {
+            let Some(index) = pending
+                .iter()
+                .position(|request| !active_channels.contains(&request.channel_id))
+            else {
+                break;
+            };
+            let request = pending.remove(index).expect("pending log exists");
+            active_channels.insert(request.channel_id);
+            let last_config = last_config_logs.remove(&request.channel_id);
+            writes.push(write_bot_log(Arc::clone(&discord), request, last_config));
+        }
+        if closed && pending.is_empty() && writes.is_empty() {
+            break;
+        }
+        tokio::select! {
+            request = rx.recv(), if !closed && pending.len() < pending_limit => {
+                if let Some(request) = request {
+                    pending.push_back(request);
                 } else {
-                    last_config_logs.remove(&channel_id);
+                    closed = true;
                 }
-                result
             }
-        };
-        if let Some(respond_to) = request.respond_to {
-            let _ = respond_to.send(result);
-        } else if let Err(source) = result {
-            last_config_logs.remove(&channel_id);
-            warn!(
-                event = "bot_log.post_failed",
-                channel_id = request.channel_id.get(),
-                ?source,
-                "failed to post bot log"
-            );
+            Some((channel_id, last_config)) = writes.next(), if !writes.is_empty() => {
+                active_channels.remove(&channel_id);
+                if let Some(last_config) = last_config {
+                    last_config_logs.insert(channel_id, last_config);
+                }
+            }
         }
     }
+}
+
+async fn write_bot_log(
+    discord: Arc<dyn DiscordEffects>,
+    request: BotLogWriteRequest,
+    last_config: Option<(Id<UserMarker>, Id<MessageMarker>)>,
+) -> (
+    Id<ChannelMarker>,
+    Option<(Id<UserMarker>, Id<MessageMarker>)>,
+) {
+    let channel_id = request.channel_id;
+    let config_user = match request.kind {
+        BotLogWriteKind::ConfigUpdate { updated_by } if request.respond_to.is_none() => {
+            Some(updated_by)
+        }
+        _ => None,
+    };
+    let operation = async {
+        if let BotLogWriteKind::Edit { message_id } = request.kind {
+            discord
+                .edit_bot_log_in_channel(channel_id, message_id, request.log)
+                .await
+                .map(|()| message_id)
+        } else if let Some((last_user, message_id)) = last_config
+            && config_user == Some(last_user)
+        {
+            discord
+                .edit_bot_log_in_channel(channel_id, message_id, request.log)
+                .await
+                .map(|()| message_id)
+        } else {
+            discord
+                .post_bot_log_to_channel(channel_id, request.log)
+                .await
+        }
+    };
+    let result = tokio::time::timeout(BOT_LOG_WRITE_TIMEOUT, operation)
+        .await
+        .context("Discord bot log delivery timed out")
+        .and_then(std::convert::identity);
+    let next_config = result.as_ref().ok().and_then(|message_id| {
+        if matches!(request.kind, BotLogWriteKind::Edit { .. }) {
+            last_config
+        } else {
+            config_user.map(|user| (user, *message_id))
+        }
+    });
+    if let Some(respond_to) = request.respond_to {
+        let _ = respond_to.send(result);
+    } else if let Err(source) = result {
+        warn!(
+            event = "bot_log.post_failed",
+            channel_id = channel_id.get(),
+            ?source,
+            "failed to post bot log"
+        );
+    }
+    (channel_id, next_config)
 }
 
 async fn performance_report_loop(mut rx: mpsc::Receiver<ImageMetricsCommand>) {
@@ -4182,6 +4251,134 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use twilight_model::id::{Id, marker::GuildMarker};
+
+    fn log_request(
+        channel: u64,
+        kind: super::BotLogWriteKind,
+        respond_to: Option<
+            oneshot::Sender<anyhow::Result<Id<twilight_model::id::marker::MessageMarker>>>,
+        >,
+    ) -> super::BotLogWriteRequest {
+        super::BotLogWriteRequest {
+            channel_id: Id::new(channel),
+            log: super::render_bot_log(super::BotLogEvent::new("test", "test")),
+            kind,
+            respond_to,
+        }
+    }
+
+    #[tokio::test]
+    async fn bot_log_writer_preserves_channel_order_without_blocking_other_channels() {
+        use crate::bot::effects::{MockDiscordCall, MockDiscordEffects};
+        use std::sync::Arc;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut mock = MockDiscordEffects::new();
+        mock.blocked_log_channel = Some(Id::new(1));
+        mock.bot_log_gate = Some(Arc::clone(&gate));
+        let discord = Arc::new(mock);
+        let (tx, rx) = mpsc::channel(8);
+        let task = tokio::spawn(super::bot_log_writer_loop(discord.clone(), rx));
+        let config = super::BotLogWriteKind::ConfigUpdate {
+            updated_by: Id::new(10),
+        };
+        tx.send(log_request(1, config, None)).await.unwrap();
+        tx.send(log_request(1, config, None)).await.unwrap();
+        let (respond, response) = oneshot::channel();
+        tx.send(log_request(
+            2,
+            super::BotLogWriteKind::Standard,
+            Some(respond),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(discord.calls.lock().len(), 1);
+        gate.add_permits(1);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let calls = discord.calls.lock();
+        assert!(
+            matches!(calls[0], MockDiscordCall::PostBotLog { channel_id, .. } if channel_id.get() == 2)
+        );
+        assert!(
+            matches!(calls[1], MockDiscordCall::PostBotLog { channel_id, .. } if channel_id.get() == 1)
+        );
+        assert!(
+            matches!(calls[2], MockDiscordCall::EditBotLog { channel_id, .. } if channel_id.get() == 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bot_log_writer_times_out_and_delivers_failure_receipt() {
+        use crate::bot::effects::MockDiscordEffects;
+        use std::sync::Arc;
+        let mut mock = MockDiscordEffects::new();
+        mock.blocked_log_channel = Some(Id::new(1));
+        mock.bot_log_gate = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+        let (tx, rx) = mpsc::channel(8);
+        let task = tokio::spawn(super::bot_log_writer_loop(Arc::new(mock), rx));
+        let (respond, response) = oneshot::channel();
+        tx.send(log_request(
+            1,
+            super::BotLogWriteKind::Standard,
+            Some(respond),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let error = response.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("delivery timed out"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bot_log_writer_edits_the_delivered_message_and_keeps_config_coalescing() {
+        use crate::bot::effects::{MockDiscordCall, MockDiscordEffects};
+        use std::sync::Arc;
+        let discord = Arc::new(MockDiscordEffects::new());
+        let (tx, rx) = mpsc::channel(8);
+        let task = tokio::spawn(super::bot_log_writer_loop(discord.clone(), rx));
+        let (respond, response) = oneshot::channel();
+        tx.send(log_request(
+            1,
+            super::BotLogWriteKind::Standard,
+            Some(respond),
+        ))
+        .await
+        .unwrap();
+        let message_id = response.await.unwrap().unwrap();
+        let config = super::BotLogWriteKind::ConfigUpdate {
+            updated_by: Id::new(10),
+        };
+        tx.send(log_request(1, config, None)).await.unwrap();
+        tx.send(log_request(
+            1,
+            super::BotLogWriteKind::Edit { message_id },
+            None,
+        ))
+        .await
+        .unwrap();
+        tx.send(log_request(1, config, None)).await.unwrap();
+        drop(tx);
+        task.await.unwrap();
+        let calls = discord.calls.lock();
+        assert_eq!(calls.len(), 4);
+        assert!(matches!(calls[0], MockDiscordCall::PostBotLog { .. }));
+        assert!(matches!(calls[1], MockDiscordCall::PostBotLog { .. }));
+        assert!(
+            matches!(calls[2], MockDiscordCall::EditBotLog { message_id: edited, .. } if edited == message_id)
+        );
+        assert!(
+            matches!(calls[3], MockDiscordCall::EditBotLog { message_id: edited, .. } if edited != message_id)
+        );
+    }
 
     #[test]
     fn config_modal_submits_defer_as_message_updates() {

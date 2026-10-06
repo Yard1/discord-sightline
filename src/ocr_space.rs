@@ -7,7 +7,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 use tracing::warn;
 
 pub const OCR_SPACE_API_KEY_ENV: &str = "OCR_SPACE_API_KEY";
@@ -32,7 +32,7 @@ impl Default for OcrSpaceConfig {
         Self {
             endpoint: "https://api.ocr.space/parse/image".to_owned(),
             timeout_seconds: 20,
-            total_timeout_seconds: 30,
+            total_timeout_seconds: 60,
             max_retries: 3,
             retry_base_delay_ms: 750,
             language: "eng".to_owned(),
@@ -65,8 +65,8 @@ impl OcrSpaceConfig {
             "ocr_space.total_timeout_seconds must be between 1 and 60"
         );
         anyhow::ensure!(
-            self.max_retries <= 3,
-            "ocr_space.max_retries must be at most 3"
+            self.max_retries <= 5,
+            "ocr_space.max_retries must be at most 5"
         );
         anyhow::ensure!(
             self.retry_base_delay_ms <= 5_000,
@@ -122,25 +122,36 @@ impl OcrSpaceClient {
         let base64_image = ocr_base64_image(crop);
         let total_deadline =
             Instant::now() + Duration::from_secs(self.config.total_timeout_seconds);
+        timeout_at(
+            total_deadline,
+            self.read_with_retries(&base64_image, total_deadline),
+        )
+        .await
+        .context("OCR.space request exceeded total timeout")?
+    }
+
+    async fn read_with_retries(
+        &self,
+        base64_image: &str,
+        total_deadline: Instant,
+    ) -> Result<OcrSpaceRead> {
         let mut last_error = None;
         for attempt in 0..=self.config.max_retries {
-            let Some(attempt_timeout) = self.remaining_attempt_timeout(total_deadline) else {
-                break;
-            };
             let attempt_permit = match &self.attempt_gate {
                 Some(gate) => Some(gate.acquire().await.context("OCR attempt gate closed")?),
                 None => None,
             };
-            let result = self
-                .try_read_crop_text(base64_image.as_str(), attempt_timeout)
-                .await;
+            // Queueing consumes the same deadline as requests and backoff.
+            let Some(attempt_timeout) = self.remaining_attempt_timeout(total_deadline) else {
+                break;
+            };
+            let result = self.try_read_crop_text(base64_image, attempt_timeout).await;
             drop(attempt_permit);
             match result {
                 Ok(read) => return Ok(read),
                 Err(error) if error.retryable && attempt < self.config.max_retries => {
-                    let mut delay = error
-                        .retry_after
-                        .unwrap_or_else(|| retry_delay(&self.config, attempt));
+                    let mut delay = retry_delay(&self.config, attempt)
+                        .max(error.retry_after.unwrap_or_default());
                     if let Some(remaining) = total_deadline.checked_duration_since(Instant::now()) {
                         delay = delay.min(remaining);
                     } else {
@@ -153,16 +164,27 @@ impl OcrSpaceClient {
                         reason = %error.message,
                         "retrying OCR.space request"
                     );
-                    last_error = Some(error.message);
+                    last_error = Some(format!(
+                        "{} (after {} attempt(s))",
+                        error.message,
+                        attempt + 1
+                    ));
                     sleep(delay).await;
                 }
-                Err(error) => return Err(anyhow!(error.message)),
+                Err(error) => {
+                    return Err(anyhow!(
+                        "{} (after {} attempt(s))",
+                        error.message,
+                        attempt + 1
+                    ));
+                }
             }
         }
 
-        Err(anyhow!(last_error.unwrap_or_else(|| {
-            "OCR.space request exceeded total timeout".to_owned()
-        })))
+        Err(anyhow!(
+            "OCR.space request exceeded total timeout{}",
+            last_error.map_or_else(String::new, |error| format!("; last error: {error}"))
+        ))
     }
 
     fn remaining_attempt_timeout(&self, total_deadline: Instant) -> Option<Duration> {
@@ -199,7 +221,11 @@ impl OcrSpaceClient {
             .map_err(|error| OcrSpaceError::from_reqwest(&error))?;
 
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        if matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+        ) || status.is_server_error()
+        {
             let retry_after = response
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
@@ -461,6 +487,199 @@ pub fn load_api_key_from_env() -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_crop() -> PreparedOcrCrop {
+        PreparedOcrCrop {
+            label: "test".to_owned(),
+            width: 1,
+            height: 1,
+            mime: "image/png".to_owned(),
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    async fn mock_ocr(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        OcrSpaceClient,
+        tokio::task::JoinHandle<Vec<Instant>>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let (requests, received_requests) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for (status, headers) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let count = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                received.push(Instant::now());
+                let _ = requests.send(());
+                let body = r#"{"ParsedResults":[{"ParsedText":"recognized text"}],"IsErroredOnProcessing":false}"#;
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            received
+        });
+        // Local HTTP is confined to this fixture; production configuration requires HTTPS.
+        let client = OcrSpaceClient {
+            http: Client::builder().no_proxy().build().unwrap(),
+            api_key: "test-key".to_owned(),
+            config: OcrSpaceConfig {
+                endpoint,
+                retry_base_delay_ms: 20,
+                total_timeout_seconds: 4,
+                ..OcrSpaceConfig::default()
+            },
+            attempt_gate: None,
+        };
+        (client, server, received_requests)
+    }
+
+    #[tokio::test]
+    async fn retries_503_with_exponential_backoff_then_succeeds() {
+        let (client, server, _) = mock_ocr(vec![(503, ""), (503, ""), (200, "")]).await;
+        let read = client.read_crop_text(&test_crop()).await.unwrap();
+        assert_eq!(read.text, "recognized text");
+        let times = server.await.unwrap();
+        assert_eq!(times.len(), 3);
+        assert!(times[1] - times[0] >= Duration::from_millis(20));
+        assert!(times[2] - times[1] >= Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn exhausted_503_reports_all_four_attempts() {
+        let (client, server, _) = mock_ocr(vec![(503, ""); 4]).await;
+        let error = client.read_crop_text(&test_crop()).await.unwrap_err();
+        assert!(error.to_string().contains("503"));
+        assert!(error.to_string().contains("after 4 attempt(s)"));
+        assert_eq!(server.await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn permanent_http_error_is_not_retried() {
+        let (client, server, _) = mock_ocr(vec![(403, "")]).await;
+        let error = client.read_crop_text(&test_crop()).await.unwrap_err();
+        assert!(error.to_string().contains("403"));
+        assert!(error.to_string().contains("after 1 attempt(s)"));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_after_does_not_shorten_backoff() {
+        let (client, server, _) = mock_ocr(vec![(429, "Retry-After: 0\r\n"), (200, "")]).await;
+        client.read_crop_text(&test_crop()).await.unwrap();
+        let times = server.await.unwrap();
+        assert!(times[1] - times[0] >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn honors_longer_retry_after() {
+        let (client, server, _) = mock_ocr(vec![(503, "Retry-After: 1\r\n"), (200, "")]).await;
+        client.read_crop_text(&test_crop()).await.unwrap();
+        let times = server.await.unwrap();
+        assert!(times[1] - times[0] >= Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_deadline_includes_waiting_for_attempt_gate() {
+        let gate = Arc::new(Semaphore::new(0));
+        let client = OcrSpaceClient::with_attempt_gate(
+            Client::new(),
+            "test-key".to_owned(),
+            OcrSpaceConfig {
+                total_timeout_seconds: 1,
+                ..OcrSpaceConfig::default()
+            },
+            Some(Arc::clone(&gate)),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.read_crop_text(&test_crop()))
+                .await
+                .expect("client deadline must expire before test deadline");
+        assert!(result.unwrap_err().to_string().contains("total timeout"));
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        gate.add_permits(1);
+        assert!(gate.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn backoff_releases_attempt_permit() {
+        let (mut client, server, mut requests) = mock_ocr(vec![(503, ""), (200, "")]).await;
+        let gate = Arc::new(Semaphore::new(1));
+        client.attempt_gate = Some(Arc::clone(&gate));
+        client.config.retry_base_delay_ms = 200;
+        let task = tokio::spawn(async move { client.read_crop_text(&test_crop()).await });
+        // Wait until the server receives the first attempt before checking backoff.
+        requests.recv().await.unwrap();
+        let permit = tokio::time::timeout(Duration::from_millis(100), gate.acquire())
+            .await
+            .expect("backoff must release the HTTP permit")
+            .unwrap();
+        assert!(!task.is_finished());
+        drop(permit);
+        task.await.unwrap().unwrap();
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn total_deadline_stops_long_retry_after() {
+        let (mut client, server, _) = mock_ocr(vec![(503, "Retry-After: 5\r\n")]).await;
+        client.config.total_timeout_seconds = 1;
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.read_crop_text(&test_crop()))
+                .await
+                .expect("total deadline must include backoff");
+        assert!(result.unwrap_err().to_string().contains("total timeout"));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn five_retries_are_valid_and_use_exponential_delays() {
+        let config = OcrSpaceConfig {
+            max_retries: 5,
+            ..OcrSpaceConfig::default()
+        };
+        config.validate().unwrap();
+        let delays: Vec<_> = (0..config.max_retries)
+            .map(|attempt| retry_delay(&config, attempt).as_millis())
+            .collect();
+        assert_eq!(delays, [750, 1500, 3000, 6000, 12000]);
+    }
+
+    #[tokio::test]
+    async fn five_retries_make_six_attempts() {
+        let (mut client, server, _) = mock_ocr(vec![(503, ""); 6]).await;
+        client.config.max_retries = 5;
+        let error = client.read_crop_text(&test_crop()).await.unwrap_err();
+        assert!(error.to_string().contains("after 6 attempt(s)"));
+        assert_eq!(server.await.unwrap().len(), 6);
+    }
 
     #[test]
     fn attempt_timeout_is_capped_by_total_deadline() {
